@@ -30,7 +30,6 @@ func newDefaultLog() Logger {
 
 func (r *recorder) log(a ...interface{}) {
 	r.logs = append(r.logs, a)
-	println("logging", len(r.logs), len(a), len(r.logs[len(r.logs)-1]))
 }
 
 func (r *recorder) logf(l logrus.Level, f string, a ...interface{}) {

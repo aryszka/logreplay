@@ -37,16 +37,27 @@ func (r *recorderHandler) ServeHTTP(_ http.ResponseWriter, req *http.Request) {
 	r.Infoln(req.Method, req.Host, req.URL.Path)
 }
 
+func (r *recorderHandler) check(t *testing.T, expected [][]string) {
+	if len(r.logs) != len(expected) {
+		t.Error("unexpected log recorded", len(r.logs), len(expected))
+	}
+
+	for i, li := range expected {
+		for j, lij := range li {
+			// +1 to ignore the level
+			if lij != r.logs[i][j+1] {
+				t.Error("unexpected log entry", i, j, r.logs[i][j+1], lij)
+			}
+		}
+	}
+}
+
 func (l *logReader) Read(p []byte) (int, error) {
-	println("reading text")
 	if l.text == "" {
-		println("text empty")
 		return 0, io.EOF
 	}
 
-	println("copying text")
 	n := copy(p, l.text)
-	println("text copied", n)
 	l.text = l.text[n:]
 	return n, nil
 }
@@ -72,23 +83,13 @@ func TestReplayAccessLog(t *testing.T) {
 	}
 
 	p.Once()
-	if len(rh.logs) != 3 {
-		t.Error("replaying requests failed", len(rh.logs), 3)
-	}
-
-	for i, li := range [][]string{{
+	rh.check(t, [][]string{{
 		"GET", "www.example.org", "/foo",
 	}, {
 		"POST", "api.example.org", "/api/foo",
 	}, {
 		"GET", "www.example.org", "/baz",
-	}} {
-		for j, lij := range li {
-			if lij != rh.logs[i][j+1] {
-				t.Error("wrong request made", i, j, rh.logs[i][j], lij)
-			}
-		}
-	}
+	}})
 }
 
 func TestReplayBlank(t *testing.T) {
@@ -113,4 +114,38 @@ func TestReplayBlank(t *testing.T) {
 	if c != requestCount {
 		t.Error("replaying requests failed", c, requestCount)
 	}
+}
+
+func TestCustomFormat(t *testing.T) {
+	const logs = `
+GET /foo www.example.org
+POST /api/foo api.example.org
+GET /bar www.example.org
+	`
+
+	const format = `^(?P<method>\S+)\s+(?P<path>\S+)\s+(?P<host>\S+)$`
+
+	rh := &recorderHandler{}
+	s := httptest.NewServer(rh)
+	defer s.Close()
+
+	p, err := New(Options{
+		AccessLog:       &logReader{logs},
+		AccessLogFormat: format,
+		Server:          s.URL,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	p.Once()
+	rh.check(t, [][]string{{
+		"GET", "www.example.org", "/foo",
+	}, {
+		"POST", "api.example.org", "/api/foo",
+	}, {
+		"GET", "www.example.org", "/bar",
+	}})
 }

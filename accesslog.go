@@ -57,12 +57,14 @@ type reader struct {
 
 type defaultParser struct {
 	format *regexp.Regexp
+	names  []string
+	log    Logger
 }
 
 func (p *defaultParser) Parse(l string) Request {
 	var r Request
-	m := defaultFormat.FindStringSubmatch(l)
-	for i, ni := range defaultNames {
+	m := p.format.FindStringSubmatch(l)
+	for i, ni := range p.names {
 		if i >= len(m) {
 			break
 		}
@@ -91,7 +93,7 @@ func newReader(input io.Reader, format string, p Parser, log Logger) (*reader, e
 			}
 		}
 
-		p = &defaultParser{format: rx}
+		p = &defaultParser{format: rx, names: rx.SubexpNames(), log: log}
 	}
 
 	return &reader{

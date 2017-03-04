@@ -228,7 +228,6 @@ func (p *Player) Once() {
 		if !func() bool {
 			var r Request
 			if p.accessLog == nil {
-				p.options.Log.Debugln("reading from parsed requests")
 				if p.position >= len(p.requests) {
 					return false
 				}
@@ -236,10 +235,8 @@ func (p *Player) Once() {
 				r = p.requests[p.position]
 				p.position++
 			} else {
-				p.options.Log.Debugln("reading from access log")
 				var err error
 				r, err = p.accessLog.ReadRequest()
-				p.options.Log.Debugln("read from access log")
 				if err != nil && err != io.EOF {
 					p.options.Log.Warnln("error while creating url:", err)
 
@@ -263,7 +260,6 @@ func (p *Player) Once() {
 					p.accessLog = nil
 					return true
 				} else {
-					p.options.Log.Debugln("access log entry")
 					p.requests = append(
 						p.requests[:p.position],
 						append(
@@ -334,7 +330,6 @@ func (p *Player) Once() {
 
 			hr.Host = h
 
-			p.options.Log.Debugln("making request to:", a, m, r.Path, r.Host)
 			rsp, err := p.client.Do(hr)
 			if err != nil {
 				p.options.Log.Warnln("error while making request:", err)
@@ -376,7 +371,6 @@ func (p *Player) Once() {
 				return true
 			}
 
-			p.options.Log.Debugln("reading body for request:", a, m, r.Path, r.Host)
 			_, err = ioutil.ReadAll(rsp.Body)
 			if err != nil {
 				p.options.Log.Warnln("error while reading request:", err)
@@ -398,7 +392,6 @@ func (p *Player) Once() {
 				return true
 			}
 
-			p.options.Log.Debugln("successful request to:", a, m, r.Path, r.Host)
 			return true
 		}() {
 			break
