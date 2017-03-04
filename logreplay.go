@@ -1,8 +1,9 @@
 // Package logreplay provides a client that can replay HTTP requests based access logs.
 //
+// The player can replay the requests once or infinitely in a loop. It can pause or
+// reset the scenario. It can replay the scenario with a concurrency level of choice.
 // The player accepts custom request definitions besides or instead of the access log
-// input. It can replay the requests once or infinitely in a loop. It can pause or reset
-// the scenario. It can replay the scenario with a concurrency level of choice.
+// input.
 //
 // The player is provided as an embeddable library, and a simple command is provided as
 // subpackage.
@@ -84,6 +85,8 @@ type Request struct {
 
 	// Chunked defines if the request content should be sent with chunked transfer
 	// encoding.
+	//
+	// TODO: what to do with requests coming from the access logs
 	Chunked bool
 }
 
@@ -106,6 +109,8 @@ type Options struct {
 	// specified in the access log, or when taking it from there is disabled, the
 	// value of the field Server is used as the host, or, if no server is specified,
 	// localhost is used.
+	//
+	// TODO: allow defining custom format
 	AccessLogHostField int
 
 	// Server is a network address to send the requests to.
@@ -138,12 +143,17 @@ type Options struct {
 	// HaltThreshold tells the player after how many errors or 500s it should apply the
 	// HaltPolicy. Default: 128.
 	HaltThreshold int
+
+	// Throttle maximizes the outgoing overall request per second rate.
+	Throttle float64
 }
 
 // Player replays HTTP requests explicitly specified and/or read from an Apache access log.
 type Player struct {
 	options      Options
+	accessLog    *reader
 	requests     []Request
+	position     int
 	client       *http.Client
 	errors       int
 	serverErrors int
@@ -155,10 +165,16 @@ func New(o Options) *Player {
 		o.Log = newDefaultLog()
 	}
 
+	var r *reader
+	if o.AccessLog != nil {
+		r = newReader(o.AccessLog, o.Log)
+	}
+
 	return &Player{
-		options:  o,
-		requests: o.Requests,
-		client:   &http.Client{Transport: &http.Transport{}},
+		options:   o,
+		accessLog: r,
+		requests:  o.Requests,
+		client:    &http.Client{Transport: &http.Transport{}},
 	}
 }
 
@@ -172,8 +188,58 @@ func (p *Player) Play() {}
 //
 // When the player is currently playing requests, it is a noop.
 func (p *Player) Once() {
-	for _, r := range p.requests {
+	for {
 		if !func() bool {
+			var r Request
+			if p.accessLog == nil {
+				p.options.Log.Debugln("reading from parsed requests")
+				if p.position >= len(p.requests) {
+					return false
+				}
+
+				r = p.requests[p.position]
+				p.position++
+			} else {
+				p.options.Log.Debugln("reading from access log")
+				var err error
+				r, err = p.accessLog.ReadRequest()
+				p.options.Log.Debugln("read from access log")
+				if err != nil && err != io.EOF {
+					p.options.Log.Warnln("error while creating url:", err)
+
+					p.errors++
+					if p.errors >= p.options.HaltThreshold {
+						switch p.options.HaltPolicy {
+						case StopOnError, StopOn500:
+							p.options.Log.Errorln("request errors exceeded threshold")
+							p.Stop()
+							return false
+						case PauseOnError, PauseOn500:
+							p.options.Log.Errorln("request errors exceeded threshold")
+							p.Pause()
+							return false
+						}
+					}
+
+					return true
+				} else if err == io.EOF {
+					p.options.Log.Infoln("access log consumed")
+					p.accessLog = nil
+					return true
+				} else {
+					p.options.Log.Debugln("access log entry")
+					p.requests = append(
+						p.requests[:p.position],
+						append(
+							[]Request{r},
+							p.requests[p.position:]...,
+						)...,
+					)
+
+					p.position++
+				}
+			}
+
 			m := r.Method
 			if m == "" {
 				m = "GET"
@@ -190,7 +256,7 @@ func (p *Player) Once() {
 
 			u, err := url.Parse(a)
 			if err != nil {
-				p.options.Log.Warnln("error while creating url: ", err)
+				p.options.Log.Warnln("error while creating url:", err)
 
 				p.errors++
 				if p.errors >= p.options.HaltThreshold {
@@ -232,10 +298,10 @@ func (p *Player) Once() {
 
 			hr.Host = h
 
-			p.options.Log.Debugln("making request to: ", a, m, r.Path, r.Host)
+			p.options.Log.Debugln("making request to:", a, m, r.Path, r.Host)
 			rsp, err := p.client.Do(hr)
 			if err != nil {
-				p.options.Log.Warnln("error while making request: ", err)
+				p.options.Log.Warnln("error while making request:", err)
 
 				p.errors++
 				if p.errors >= p.options.HaltThreshold {
@@ -274,10 +340,10 @@ func (p *Player) Once() {
 				return true
 			}
 
-			p.options.Log.Debugln("reading body for request: ", a, m, r.Path, r.Host)
+			p.options.Log.Debugln("reading body for request:", a, m, r.Path, r.Host)
 			_, err = ioutil.ReadAll(rsp.Body)
 			if err != nil {
-				p.options.Log.Warnln("error while reading request: ", err)
+				p.options.Log.Warnln("error while reading request:", err)
 
 				p.errors++
 				if p.errors >= p.options.HaltThreshold {
@@ -296,7 +362,7 @@ func (p *Player) Once() {
 				return true
 			}
 
-			p.options.Log.Debugln("successful request to: ", a, m, r.Path, r.Host)
+			p.options.Log.Debugln("successful request to:", a, m, r.Path, r.Host)
 			return true
 		}() {
 			break
