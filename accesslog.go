@@ -7,10 +7,6 @@ import (
 	"strings"
 )
 
-// known bugs:
-// - escaped double quotes in the HTTP message
-// - whitespace handling in the HTTP message
-
 const defaultFormatExpression = `^` +
 
 	// remote address:
@@ -54,15 +50,55 @@ var (
 )
 
 type reader struct {
-	scanner *bufio.Scanner
-	log     Logger
+	scanner    *bufio.Scanner
+	lineParser Parser
+	log        Logger
 }
 
-func newReader(input io.Reader, log Logger) *reader {
-	return &reader{
-		scanner: bufio.NewScanner(input),
-		log:     log,
+type defaultParser struct {
+	format *regexp.Regexp
+}
+
+func (p *defaultParser) Parse(l string) Request {
+	var r Request
+	m := defaultFormat.FindStringSubmatch(l)
+	for i, ni := range defaultNames {
+		if i >= len(m) {
+			break
+		}
+
+		switch ni {
+		case "method":
+			r.Method = m[i]
+		case "host":
+			r.Host = m[i]
+		case "path":
+			r.Path = m[i]
+		}
 	}
+
+	return r
+}
+
+func newReader(input io.Reader, format string, p Parser, log Logger) (*reader, error) {
+	if p == nil {
+		rx := defaultFormat
+		if format != "" {
+			var err error
+			rx, err = regexp.Compile(format)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		p = &defaultParser{format: rx}
+	}
+
+	return &reader{
+		scanner:    bufio.NewScanner(input),
+		lineParser: p,
+		log:        log,
+	}, nil
 }
 
 // document default token size
@@ -82,27 +118,6 @@ func (r *reader) ReadRequest() (req Request, err error) {
 		return r.ReadRequest()
 	}
 
-	r.log.Debugf("matching: >%s<", r.scanner.Text())
-	m := defaultFormat.FindStringSubmatch(l)
-	for i, mi := range m {
-		r.log.Debugf("submatch: %d: >%s<", i, mi)
-	}
-
-	for i, ni := range defaultNames {
-		if i >= len(m) {
-			break
-		}
-
-		switch ni {
-		case "method":
-			req.Method = m[i]
-		case "host":
-			req.Host = m[i]
-		case "path":
-			req.Path = m[i]
-		}
-	}
-
-	r.log.Debugln("scanned:", r.scanner.Text())
+	req = r.lineParser.Parse(l)
 	return
 }

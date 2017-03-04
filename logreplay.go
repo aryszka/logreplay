@@ -90,6 +90,14 @@ type Request struct {
 	Chunked bool
 }
 
+// Parser can parse a log entry.
+type Parser interface {
+
+	// Parse parses a log entry. It accepts a log line as a string
+	// and returns a Request definition.
+	Parse(string) Request
+}
+
 // Options is used to initialize a player.
 type Options struct {
 
@@ -99,9 +107,33 @@ type Options struct {
 	// executed in the beginning of the scenario.
 	Requests []Request
 
-	// AccessLog is a source of scenario to be executed by the player. It expects a
-	// stream of Apache access log entries, and uses the %r field to forge requests.
+	// AccessLog is a source of scenario to be executed by the player. By default, it
+	// expects a stream of Apache access log entries, and uses the %r field to forge
+	// requests.
+	//
+	// In addition to the Combined log format, the default parser accepts two additional
+	// fields based on the Skipper (https://github.com/zalando/skipper) access logs,
+	// where the request host is taken from the last field (following an integer for
+	// duration.)
+	//
+	// Known bugs in the default parser:
+	//
+	// 	- escaped double quotes in the HTTP message not handled
+	// 	- whitespace handling in the HTTP message: only whitespace
+	//
 	AccessLog io.Reader
+
+	// AccessLogFormat is a regular expression and can be used to override the default
+	// parser expression. The expression can define the following named groups:
+	// method, host, path. The captured submatches with these names will be used to
+	// set the according field in the parsed request.
+	//
+	// If Parser is set, this field is ignored.
+	AccessLogFormat string
+
+	// Parser is a custom parser for log entries (lines). It can be used e.g. to define
+	// a JSON log parser.
+	Parser Parser
 
 	// AccessLogHostField tells the access log parser to take the request from a
 	// specific position in the Apache Combined Log Format. Defaults to 11. Value
@@ -160,14 +192,18 @@ type Player struct {
 }
 
 // New initialzies a player.
-func New(o Options) *Player {
+func New(o Options) (*Player, error) {
 	if o.Log == nil {
 		o.Log = newDefaultLog()
 	}
 
 	var r *reader
 	if o.AccessLog != nil {
-		r = newReader(o.AccessLog, o.Log)
+		var err error
+		r, err = newReader(o.AccessLog, o.AccessLogFormat, o.Parser, o.Log)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &Player{
@@ -175,7 +211,7 @@ func New(o Options) *Player {
 		accessLog: r,
 		requests:  o.Requests,
 		client:    &http.Client{Transport: &http.Transport{}},
-	}
+	}, nil
 }
 
 // Play replays the requests infinitely with the specified concurrency. If an access log is

@@ -61,10 +61,15 @@ func TestReplayAccessLog(t *testing.T) {
 	s := httptest.NewServer(rh)
 	defer s.Close()
 
-	p := New(Options{
+	p, err := New(Options{
 		AccessLog: &logReader{accessLog},
 		Server:    s.URL,
 	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
 
 	p.Once()
 	if len(rh.logs) != 3 {
@@ -94,10 +99,15 @@ func TestReplayBlank(t *testing.T) {
 	defer s.Close()
 
 	var reqs [requestCount]Request
-	p := New(Options{
+	p, err := New(Options{
 		Requests: reqs[:],
 		Server:   s.URL,
 	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
 
 	p.Once()
 	if c != requestCount {
