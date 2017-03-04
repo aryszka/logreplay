@@ -10,6 +10,7 @@
 package logreplay
 
 import (
+	"errors"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -191,6 +192,8 @@ type Player struct {
 	serverErrors int
 }
 
+var errServerStatus = errors.New("unexpected server status")
+
 // New initialzies a player.
 func New(o Options) (*Player, error) {
 	if o.Log == nil {
@@ -214,6 +217,159 @@ func New(o Options) (*Player, error) {
 	}, nil
 }
 
+func (p *Player) nextRequest() (Request, bool) {
+	var r Request
+	if p.accessLog == nil {
+		if p.position >= len(p.requests) {
+			return r, false
+		}
+
+		r = p.requests[p.position]
+		p.position++
+		return r, true
+	}
+
+	var err error
+	r, err = p.accessLog.ReadRequest()
+	if err != nil && err != io.EOF {
+		p.options.Log.Warnln("error while reading access log:", err)
+
+		p.errors++
+		if p.checkHaltError() {
+			return r, false
+		}
+
+		return p.nextRequest()
+	}
+
+	if err == io.EOF {
+		p.accessLog = nil
+		return p.nextRequest()
+	}
+
+	p.requests = append(
+		p.requests[:p.position],
+		append(
+			[]Request{r},
+			p.requests[p.position:]...,
+		)...,
+	)
+
+	p.position++
+	return r, true
+}
+
+func (p *Player) createHTTPRequest(r Request) (*http.Request, error) {
+	m := r.Method
+	if m == "" {
+		m = "GET"
+	}
+
+	a := p.options.Server
+	if a == "" {
+		if r.Host == "" {
+			a = "http://localhost"
+		} else {
+			a = "http://" + r.Host
+		}
+	}
+
+	u, err := url.Parse(a)
+	if err != nil {
+		return nil, err
+	}
+
+	if u.Scheme == "" {
+		u.Scheme = "http"
+	}
+
+	u.Path = r.Path
+
+	hr, err := http.NewRequest(m, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	h := r.Host
+	if h == "" {
+		h = p.options.Server
+	}
+
+	if h == "" {
+		h = "localhost"
+	}
+
+	hr.Host = h
+
+	return hr, nil
+}
+
+func (p *Player) sendRequest(r Request) error {
+	hr, err := p.createHTTPRequest(r)
+	if err != nil {
+		p.options.Log.Errorln("failed to create request", err)
+		return err
+	}
+
+	rsp, err := p.client.Do(hr)
+	if err != nil {
+		p.options.Log.Warnln("error while making request:", err)
+		return err
+	}
+
+	defer rsp.Body.Close()
+
+	if rsp.StatusCode >= http.StatusInternalServerError {
+		return errServerStatus
+	}
+
+	_, err = ioutil.ReadAll(rsp.Body)
+	if err != nil {
+		p.options.Log.Warnln("error while reading request body:", err)
+		return err
+	}
+
+	return nil
+}
+
+func (p *Player) checkHaltError() bool {
+	if p.errors < p.options.HaltThreshold {
+		return false
+	}
+
+	p.options.Log.Errorln("request errors exceeded threshold")
+
+	switch p.options.HaltPolicy {
+	case StopOnError, StopOn500:
+		p.Stop()
+		return true
+	case PauseOnError, PauseOn500:
+		p.Pause()
+		return true
+	}
+
+	return false
+}
+
+func (p *Player) checkHaltStatus() bool {
+	if p.serverErrors < p.options.HaltThreshold {
+		return false
+	}
+
+	p.options.Log.Errorln("server errors exceeded threshold")
+
+	switch p.options.HaltPolicy {
+	case StopOn500:
+		p.Stop()
+		return true
+	case PauseOn500:
+		p.Pause()
+		return true
+	}
+
+	return false
+}
+
 // Play replays the requests infinitely with the specified concurrency. If an access log is
 // specified it reads it to the end only once, and it repeats the read requests from then on.
 //
@@ -225,176 +381,27 @@ func (p *Player) Play() {}
 // When the player is currently playing requests, it is a noop.
 func (p *Player) Once() {
 	for {
-		if !func() bool {
-			var r Request
-			if p.accessLog == nil {
-				if p.position >= len(p.requests) {
-					return false
-				}
-
-				r = p.requests[p.position]
-				p.position++
-			} else {
-				var err error
-				r, err = p.accessLog.ReadRequest()
-				if err != nil && err != io.EOF {
-					p.options.Log.Warnln("error while creating url:", err)
-
-					p.errors++
-					if p.errors >= p.options.HaltThreshold {
-						switch p.options.HaltPolicy {
-						case StopOnError, StopOn500:
-							p.options.Log.Errorln("request errors exceeded threshold")
-							p.Stop()
-							return false
-						case PauseOnError, PauseOn500:
-							p.options.Log.Errorln("request errors exceeded threshold")
-							p.Pause()
-							return false
-						}
-					}
-
-					return true
-				} else if err == io.EOF {
-					p.options.Log.Infoln("access log consumed")
-					p.accessLog = nil
-					return true
-				} else {
-					p.requests = append(
-						p.requests[:p.position],
-						append(
-							[]Request{r},
-							p.requests[p.position:]...,
-						)...,
-					)
-
-					p.position++
-				}
-			}
-
-			m := r.Method
-			if m == "" {
-				m = "GET"
-			}
-
-			a := p.options.Server
-			if a == "" {
-				if r.Host == "" {
-					a = "http://localhost"
-				} else {
-					a = "http://" + r.Host
-				}
-			}
-
-			u, err := url.Parse(a)
-			if err != nil {
-				p.options.Log.Warnln("error while creating url:", err)
-
-				p.errors++
-				if p.errors >= p.options.HaltThreshold {
-					switch p.options.HaltPolicy {
-					case StopOnError, StopOn500:
-						p.options.Log.Errorln("request errors exceeded threshold")
-						p.Stop()
-						return false
-					case PauseOnError, PauseOn500:
-						p.options.Log.Errorln("request errors exceeded threshold")
-						p.Pause()
-						return false
-					}
-				}
-
-				return true
-			}
-
-			if u.Scheme == "" {
-				u.Scheme = "http"
-			}
-
-			u.Path = r.Path
-
-			hr, err := http.NewRequest(m, u.String(), nil)
-			if err != nil {
-				p.options.Log.Errorln("failed to create request", err)
-				return true
-			}
-
-			h := r.Host
-			if h == "" {
-				h = p.options.Server
-			}
-
-			if h == "" {
-				h = "localhost"
-			}
-
-			hr.Host = h
-
-			rsp, err := p.client.Do(hr)
-			if err != nil {
-				p.options.Log.Warnln("error while making request:", err)
-
-				p.errors++
-				if p.errors >= p.options.HaltThreshold {
-					switch p.options.HaltPolicy {
-					case StopOnError, StopOn500:
-						p.options.Log.Errorln("request errors exceeded threshold")
-						p.Stop()
-						return false
-					case PauseOnError, PauseOn500:
-						p.options.Log.Errorln("request errors exceeded threshold")
-						p.Pause()
-						return false
-					}
-				}
-
-				return true
-			}
-
-			defer rsp.Body.Close()
-
-			if rsp.StatusCode >= http.StatusInternalServerError {
-				p.serverErrors++
-				if p.serverErrors > p.options.HaltThreshold {
-					switch p.options.HaltPolicy {
-					case StopOn500:
-						p.options.Log.Errorln("server errors exceeded threshold")
-						p.Stop()
-						return false
-					case PauseOn500:
-						p.options.Log.Errorln("server errors exceeded threshold")
-						p.Pause()
-						return false
-					}
-				}
-
-				return true
-			}
-
-			_, err = ioutil.ReadAll(rsp.Body)
-			if err != nil {
-				p.options.Log.Warnln("error while reading request:", err)
-
-				p.errors++
-				if p.errors >= p.options.HaltThreshold {
-					switch p.options.HaltPolicy {
-					case StopOnError, StopOn500:
-						p.options.Log.Errorln("request errors exceeded threshold")
-						p.Stop()
-						return false
-					case PauseOnError, PauseOn500:
-						p.options.Log.Errorln("request errors exceeded threshold")
-						p.Pause()
-						return false
-					}
-				}
-
-				return true
-			}
-
-			return true
-		}() {
+		r, ok := p.nextRequest()
+		if !ok {
 			break
+		}
+
+		err := p.sendRequest(r)
+		if err == nil {
+			continue
+		}
+
+		switch err {
+		case errServerStatus:
+			p.serverErrors++
+			if p.checkHaltStatus() {
+				break
+			}
+		default:
+			p.errors++
+			if p.checkHaltError() {
+				break
+			}
 		}
 	}
 }
