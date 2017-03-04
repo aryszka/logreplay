@@ -1,6 +1,7 @@
 package logreplay
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,10 @@ type recorderHandler struct {
 
 type logReader struct {
 	text string
+}
+
+type testJSONParser struct {
+	test *testing.T
 }
 
 var ok = statusHandler(http.StatusOK)
@@ -60,6 +65,25 @@ func (l *logReader) Read(p []byte) (int, error) {
 	n := copy(p, l.text)
 	l.text = l.text[n:]
 	return n, nil
+}
+
+func (p *testJSONParser) Parse(line string) Request {
+	var (
+		req Request
+		m   map[string]string
+	)
+
+	err := json.Unmarshal([]byte(line), &m)
+	if err != nil {
+		p.test.Error(err)
+		return req
+	}
+
+	req.Method = m["method"]
+	req.Host = m["host"]
+	req.Path = m["path"]
+
+	return req
 }
 
 func TestReplayAccessLog(t *testing.T) {
@@ -132,6 +156,41 @@ GET /bar www.example.org
 	p, err := New(Options{
 		AccessLog:       &logReader{logs},
 		AccessLogFormat: format,
+		Server:          s.URL,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	p.Once()
+	rh.check(t, [][]string{{
+		"GET", "www.example.org", "/foo",
+	}, {
+		"POST", "api.example.org", "/api/foo",
+	}, {
+		"GET", "www.example.org", "/bar",
+	}})
+}
+
+func TestCustomParser(t *testing.T) {
+	const logs = `
+{"method": "GET", "host": "www.example.org", "path": "/foo"}
+{"method": "POST", "host": "api.example.org", "path": "/api/foo"}
+{"method": "GET", "host": "www.example.org", "path": "/bar"}
+	`
+
+	const invalidFormatToIgnore = "\\"
+
+	rh := &recorderHandler{}
+	s := httptest.NewServer(rh)
+	defer s.Close()
+
+	p, err := New(Options{
+		AccessLog:       &logReader{logs},
+		AccessLogFormat: invalidFormatToIgnore,
+		Parser:          &testJSONParser{t},
 		Server:          s.URL,
 	})
 
