@@ -26,6 +26,10 @@ type slowMotionHandler struct {
 	signal signalChannel
 }
 
+type redirectHandler struct {
+	location string
+}
+
 type logReader struct {
 	text string
 }
@@ -78,6 +82,11 @@ func (l *limitHandler) ServeHTTP(http.ResponseWriter, *http.Request) {
 
 func (s *slowMotionHandler) ServeHTTP(http.ResponseWriter, *http.Request) {
 	<-s.signal
+}
+
+func (rh *redirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Location", rh.location)
+	w.WriteHeader(http.StatusFound)
 }
 
 func chainHandlers(h ...http.Handler) http.Handler {
@@ -277,20 +286,16 @@ GET /bar www.example.org
 	p.Stop()
 }
 
-func TestPanicOnNoRequests(t *testing.T) {
+func TestErrorOnNoRequests(t *testing.T) {
 	p, err := New(Options{})
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	defer func() {
-		if recover() != errNoRequests {
-			t.Error("failed to panic")
-		}
-	}()
-
-	p.Play()
+	if p.Play() == nil {
+		t.Error("failed to fail")
+	}
 }
 
 func TestCombined(t *testing.T) {
@@ -338,4 +343,97 @@ GET /bar www.example.org
 
 	<-notify
 	p.Stop()
+}
+
+func TestDoesNotFollowRedirects(t *testing.T) {
+	notify := make(signalChannel)
+	s := httptest.NewServer(chainHandlers(&limitHandler{notify: notify, limit: 2}, &redirectHandler{"/bar"}))
+	defer s.Close()
+
+	p, err := New(Options{Requests: []Request{{}}, Server: s.URL})
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	done := make(signalChannel)
+	go func() {
+		p.Once()
+		done <- token
+	}()
+
+	select {
+	case <-notify:
+		t.Error("failed to stop redirect")
+	case <-done:
+	}
+}
+
+func TestFollowSameHostOnly(t *testing.T) {
+	var c1 counterHandler
+	s1 := httptest.NewServer(&c1)
+	defer s1.Close()
+
+	var c2 counterHandler
+	s2 := httptest.NewServer(chainHandlers(&c2, &redirectHandler{s1.URL}))
+	defer s2.Close()
+
+	var c3 counterHandler
+	notify := make(signalChannel)
+	s3 := httptest.NewServer(chainHandlers(
+		&c3,
+		&limitHandler{notify: notify, limit: 2},
+		&redirectHandler{"/bar"},
+	))
+	defer s3.Close()
+
+	requests := []Request{{
+		Host: s2.URL,
+	}, {
+		Host: s3.URL,
+	}}
+	p, err := New(Options{
+		Requests:         requests,
+		RedirectBehavior: FollowSameHost,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	go p.Once()
+	<-notify
+
+	if c1 != 0 || c2 != 1 || c3 != 2 {
+		t.Error("failed to apply redirect behavior")
+	}
+}
+
+func TestFollowRedirect(t *testing.T) {
+	var c1 counterHandler
+	s1 := httptest.NewServer(&c1)
+	defer s1.Close()
+
+	var c2 counterHandler
+	s2 := httptest.NewServer(chainHandlers(&c2, &redirectHandler{s1.URL}))
+	defer s2.Close()
+
+	requests := []Request{{
+		Host: s2.URL,
+	}}
+	p, err := New(Options{
+		Requests:         requests,
+		RedirectBehavior: FollowRedirect,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	p.Once()
+	if c1 != 1 || c2 != 1 {
+		t.Error("failed to apply redirect behavior", c1, c2)
+	}
 }

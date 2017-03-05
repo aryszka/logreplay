@@ -15,6 +15,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // RedirectBehavior defines how to handle redirect responses.
@@ -25,13 +26,13 @@ const (
 	// NoFollow tells the player not to follow redirects.
 	NoFollow RedirectBehavior = iota
 
-	// SameHost tells the player to follow redirects only to the same host
+	// FollowSameHost tells the player to follow redirects only to the same host
 	// as the request was made to.
-	SameHost
+	FollowSameHost
 
-	// Follow tells the player to follow all redirects. (Not recommended
+	// FollowRedirect tells the player to follow all redirects. (Not recommended
 	// during load tests.)
-	Follow
+	FollowRedirect
 )
 
 // HaltPolicy defines whether to halt on failed requests. It is used in combination
@@ -105,7 +106,7 @@ type Options struct {
 	// Requests to be executed by the player in the specified order.
 	//
 	// When used together with AccessLog, requests defined in this field are
-	// executed in the beginning of the scenario.
+	// executed after the requests read from the AccessLog.
 	Requests []Request
 
 	// AccessLog is a source of scenario to be executed by the player. By default, it
@@ -139,18 +140,12 @@ type Options struct {
 	// a JSON log parser.
 	Parser Parser
 
-	// AccessLogHostField tells the access log parser to take the request from a
-	// specific position in the Apache Combined Log Format. Defaults to 11. Value
-	// -1 prevents to set the host from the access log. When the host field not
-	// specified in the access log, or when taking it from there is disabled, the
-	// value of the field Server is used as the host, or, if no server is specified,
-	// localhost is used.
-	//
-	// TODO: allow defining custom format
-	AccessLogHostField int
-
 	// Server is a network address to send the requests to.
 	Server string
+
+	// DefaultScheme tells whether http or https should be used when the network address
+	// is taken from the host specified in the request, and the scheme is not specified.
+	DefaultScheme string
 
 	// ConcurrentSessions tells the player how many concurrent clients should replay
 	// the requests.
@@ -162,11 +157,11 @@ type Options struct {
 	RedirectBehavior RedirectBehavior
 
 	// PostContentLength tells the player the average request content size to send in
-	// case of POST, PUT and PATCH requests read from the access log.
+	// case of POST, PUT and PATCH requests ware taken from the access log.
 	PostContentLength int
 
-	// PostContentLengthDeviation defines how much the actual random cotnent length of
-	// a request read from the access log can differ from PostContentLength.
+	// PostContentLengthDeviation defines how much the actual random content length of
+	// a request taken from the access log can differ from PostContentLength.
 	PostContentLengthDeviation float64
 
 	// Log defines a custom logger for the player.
@@ -229,10 +224,14 @@ func New(o Options) (*Player, error) {
 		}
 	}
 
+	if o.DefaultScheme == "" {
+		o.DefaultScheme = "http"
+	}
+
 	notRunning := make(signalChannel, 1)
 	notRunning <- token
 
-	return &Player{
+	p := &Player{
 		options:        o,
 		accessLog:      r,
 		customRequests: o.Requests,
@@ -242,7 +241,25 @@ func New(o Options) (*Player, error) {
 		signalOnce:     make(chan signalChannel),
 		signalPause:    make(chan signalChannel),
 		signalStop:     make(chan signalChannel),
-	}, nil
+	}
+
+	p.client.CheckRedirect = p.checkRedirect
+	return p, nil
+}
+
+func (p *Player) checkRedirect(rn *http.Request, rp []*http.Request) error {
+	switch p.options.RedirectBehavior {
+	case FollowSameHost:
+		if rn.URL.Host != rp[0].URL.Host {
+			return http.ErrUseLastResponse
+		}
+
+		return nil
+	case FollowRedirect:
+		return nil
+	default:
+		return http.ErrUseLastResponse
+	}
 }
 
 func (p *Player) nextRequest() (Request, error) {
@@ -292,7 +309,11 @@ func (p *Player) createHTTPRequest(r Request) (*http.Request, error) {
 		if r.Host == "" {
 			a = "http://localhost"
 		} else {
-			a = "http://" + r.Host
+			a = r.Host
+		}
+
+		if !strings.HasPrefix(a, "http://") && !strings.HasPrefix(a, "https://") {
+			a = p.options.DefaultScheme + "://" + a
 		}
 	}
 
@@ -484,16 +505,14 @@ func (p *Player) signal(s chan signalChannel) {
 // use Pause() or Stop(), they need to be called from a different goroutine. To cleanup
 // resources, it must be stopped. Play(), Once() and Pause() can be called any number of times
 // during a session started by Play() or Once().
-func (p *Player) Play() {
+func (p *Player) Play() error {
 	if !p.isRunning() {
 		go p.run()
 	}
 
 	done := make(errorChannel)
 	p.signalPlay <- done
-	if err := <-done; err != nil {
-		panic(err)
-	}
+	return <-done
 }
 
 // Once replays the requests once.
