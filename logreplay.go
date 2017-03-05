@@ -290,7 +290,7 @@ func (p *Player) checkHaltError() bool {
 }
 
 func (p *Player) checkHaltStatus() bool {
-	if p.serverErrors < p.options.HaltThreshold {
+	if !p.options.HaltOn500 || p.serverErrors < p.options.HaltThreshold {
 		return false
 	}
 
@@ -401,9 +401,11 @@ func (p *Player) run() {
 	results := make(errorChannel)
 	p.waitingError = nil
 
+	o := p.options
+	o.Throttle = p.options.Throttle / float64(p.options.ConcurrentSessions)
 	p.players = make([]*player, p.options.ConcurrentSessions)
 	for i := 0; i < p.options.ConcurrentSessions; i++ {
-		p.players[i] = newPlayer(p.options, requestFeed, results)
+		p.players[i] = newPlayer(o, requestFeed, results)
 		go p.players[i].run()
 	}
 
