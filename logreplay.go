@@ -61,18 +61,18 @@ type Request struct {
 	// When ContentLengthDeviation is defined, the actual size will be randomly
 	// decided by ContentLength +/- rand(ContentLengthDeviation).
 	//
-	// The HTTP ContentLength header is set only when Chunked is false.
+	// The HTTP ContentLength header is set only when SetContentLength is false.
 	ContentLength int
 
 	// ContentLengthDeviation defines how much the actual random content length of
 	// a request can differ from ContentLength.
 	ContentLengthDeviation float64
 
-	// Chunked defines if the request content should be sent with chunked transfer
+	// SetContentLength defines if the request content should be sent with chunked transfer
 	// encoding.
 	//
 	// TODO: what to do with requests coming from the access logs
-	Chunked bool
+	SetContentLength bool
 }
 
 // Parser can parse a log entry.
@@ -147,8 +147,8 @@ type Options struct {
 	// a request taken from the access log can differ from PostContentLength.
 	PostContentLengthDeviation float64
 
-	// PostContentChunked defines whether request content should be sent chunked.
-	PostContentChunked bool
+	// PostSetContentLength defines whether request content should be sent chunked.
+	PostSetContentLength bool
 
 	// Log defines a custom logger for the player.
 	Log Logger
@@ -264,7 +264,7 @@ func (p *Player) accessLogContentSettings(r Request) Request {
 
 	r.ContentLength = p.options.PostContentLength
 	r.ContentLengthDeviation = p.options.PostContentLengthDeviation
-	r.Chunked = p.options.PostContentChunked
+	r.SetContentLength = p.options.PostSetContentLength
 
 	return r
 }
@@ -353,7 +353,7 @@ func (p *Player) createHTTPRequest(r Request) (*http.Request, error) {
 		return nil, err
 	}
 
-	if hasContent && !r.Chunked {
+	if hasContent && r.SetContentLength {
 		hr.ContentLength = int64(contentLength)
 	}
 

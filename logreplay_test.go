@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -32,6 +33,10 @@ type redirectHandler struct {
 }
 
 type contentLengthHandler int
+
+type headerCaptureHandler struct {
+	header http.Header
+}
 
 type logReader struct {
 	text string
@@ -100,6 +105,10 @@ func (c *contentLengthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	*c += contentLengthHandler(len(b))
+}
+
+func (hc *headerCaptureHandler) ServeHTTP(_ http.ResponseWriter, r *http.Request) {
+	hc.header = r.Header
 }
 
 func chainHandlers(h ...http.Handler) http.Handler {
@@ -594,6 +603,42 @@ func TestRequestWithContent(t *testing.T) {
 	}
 
 	once(t, p)
+
+	if cl < 450 || cl > 550 {
+		t.Error("failed to send the right content", cl)
+	}
+}
+
+func TestAccessLogWithContent(t *testing.T) {
+	const (
+		log    = `POST /foo www.example.org`
+		format = `^(?P<method>\S+)\s+(?P<path>\S+)\s+(?P<host>\S+)$`
+	)
+
+	hc := &headerCaptureHandler{}
+	var cl contentLengthHandler
+	s := httptest.NewServer(chainHandlers(hc, &cl))
+	defer s.Close()
+
+	p, err := New(Options{
+		AccessLog:                  &logReader{log},
+		AccessLogFormat:            format,
+		PostContentLength:          500,
+		PostContentLengthDeviation: 0.1,
+		PostSetContentLength:       true,
+		Server:                     s.URL,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	once(t, p)
+
+	if hc.header.Get("Content-Length") != strconv.Itoa(int(cl)) {
+		t.Error("invalid content length")
+	}
 
 	if cl < 450 || cl > 550 {
 		t.Error("failed to send the right content", cl)
