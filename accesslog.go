@@ -61,8 +61,8 @@ type defaultParser struct {
 	log    Logger
 }
 
-func (p *defaultParser) Parse(l string) Request {
-	var r Request
+func (p *defaultParser) Parse(l string) *Request {
+	r := &Request{}
 	m := p.format.FindStringSubmatch(l)
 	for i, ni := range p.names {
 		if i >= len(m) {
@@ -104,7 +104,7 @@ func newReader(input io.Reader, format string, p Parser, log Logger) (*reader, e
 }
 
 // document default token size
-func (r *reader) ReadRequest() (req Request, err error) {
+func (r *reader) ReadRequest() (req *Request, err error) {
 	if !r.scanner.Scan() {
 		if err = r.scanner.Err(); err != nil {
 			return

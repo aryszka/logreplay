@@ -17,10 +17,6 @@ package logreplay
 import (
 	"errors"
 	"io"
-	"io/ioutil"
-	"net/http"
-	"net/url"
-	"strings"
 )
 
 // RedirectBehavior defines how to handle redirect responses.
@@ -68,10 +64,8 @@ type Request struct {
 	// a request can differ from ContentLength.
 	ContentLengthDeviation float64
 
-	// SetContentLength defines if the request content should be sent with chunked transfer
-	// encoding.
-	//
-	// TODO: what to do with requests coming from the access logs
+	// SetContentLength defines if the request content should be sent with defined
+	// Content-Length header.
 	SetContentLength bool
 }
 
@@ -80,7 +74,7 @@ type Parser interface {
 
 	// Parse parses a log entry. It accepts a log line as a string
 	// and returns a Request definition.
-	Parse(string) Request
+	Parse(string) *Request
 }
 
 // Options is used to initialize a player.
@@ -90,7 +84,7 @@ type Options struct {
 	//
 	// When used together with AccessLog, requests defined in this field are
 	// executed after the requests read from the AccessLog.
-	Requests []Request
+	Requests []*Request
 
 	// AccessLog is a source of scenario to be executed by the player. By default, it
 	// expects a stream of Apache access log entries, and uses the %r field to forge
@@ -147,7 +141,8 @@ type Options struct {
 	// a request taken from the access log can differ from PostContentLength.
 	PostContentLengthDeviation float64
 
-	// PostSetContentLength defines whether request content should be sent chunked.
+	// PostSetContentLength defines whether a request content should be sent with defined
+	// Content-Length header.
 	PostSetContentLength bool
 
 	// Log defines a custom logger for the player.
@@ -165,19 +160,18 @@ type Options struct {
 }
 
 type (
-	signalToken   struct{}
-	signalChannel chan signalToken
-	errorChannel  chan error
+	signalToken    struct{}
+	signalChannel  chan signalToken
+	errorChannel   chan error
+	requestChannel chan *Request
 )
 
 // Player replays HTTP requests explicitly specified and/or read from an Apache access log.
 type Player struct {
 	options        Options
 	accessLog      *reader
-	logEntries     []Request
-	customRequests []Request
-	position       int
-	client         *http.Client
+	logEntries     []*Request
+	customRequests []*Request
 	errors         int
 	serverErrors   int
 	notRunning     signalChannel
@@ -192,14 +186,13 @@ var (
 	// a row.
 	ErrServerError = errors.New("server error")
 
-	// ErrReqeustError is returned when the request failed multiple times in a row.
-	ErrReqeustError = errors.New("request failed")
+	// ErrRequestError is returned when the request failed multiple times in a row.
+	ErrRequestError = errors.New("request failed")
 
 	// ErrNoRequests is returned when the there are no requests to be executed by Play().
 	ErrNoRequests = errors.New("no requests to play")
 
-	errAccessLogEOF = errors.New("access log EOF")
-	token           = signalToken{}
+	token = signalToken{}
 )
 
 // New initialzies a player.
@@ -221,6 +214,11 @@ func New(o Options) (*Player, error) {
 		o.DefaultScheme = "http"
 	}
 
+	if o.ConcurrentSessions <= 0 {
+		o.ConcurrentSessions = 1
+	}
+
+	// enable starting the player:
 	notRunning := make(signalChannel, 1)
 	notRunning <- token
 
@@ -228,7 +226,6 @@ func New(o Options) (*Player, error) {
 		options:        o,
 		accessLog:      r,
 		customRequests: o.Requests,
-		client:         &http.Client{Transport: &http.Transport{}},
 		notRunning:     notRunning,
 		signalPlay:     make(chan errorChannel, 1),
 		signalOnce:     make(chan errorChannel, 1),
@@ -236,167 +233,52 @@ func New(o Options) (*Player, error) {
 		signalStop:     make(chan signalChannel, 1),
 	}
 
-	p.client.CheckRedirect = p.checkRedirect
 	return p, nil
 }
 
-func (p *Player) checkRedirect(rn *http.Request, rp []*http.Request) error {
-	switch p.options.RedirectBehavior {
-	case FollowSameHost:
-		if rn.URL.Host != rp[0].URL.Host {
-			return http.ErrUseLastResponse
-		}
-
-		return nil
-	case FollowRedirect:
-		return nil
-	default:
-		return http.ErrUseLastResponse
-	}
-}
-
-func (p *Player) accessLogContentSettings(r Request) Request {
+func (p *Player) contentSettings(r *Request) {
 	switch r.Method {
 	case "POST", "PUT", "PATCH":
 	default:
-		return r
+		return
 	}
 
 	r.ContentLength = p.options.PostContentLength
 	r.ContentLengthDeviation = p.options.PostContentLengthDeviation
 	r.SetContentLength = p.options.PostSetContentLength
-
-	return r
 }
 
-func (p *Player) nextRequest() (Request, error) {
-	var r Request
-	if p.position < len(p.logEntries) {
-		r = p.logEntries[p.position]
-		r = p.accessLogContentSettings(r)
-		p.position++
+func (p *Player) nextRequest(position int) (*Request, error) {
+	if position < len(p.logEntries) {
+		r := p.logEntries[position]
+		p.contentSettings(r)
 		return r, nil
 	}
 
 	if p.accessLog == nil {
-		pcustom := p.position - len(p.logEntries)
-		if pcustom >= len(p.customRequests) {
-			return r, io.EOF
+		position -= len(p.logEntries)
+		if position >= len(p.customRequests) {
+			return nil, io.EOF
 		}
 
-		r = p.customRequests[pcustom]
-		p.position++
-		return r, nil
+		return p.customRequests[position], nil
 	}
 
 	var err error
-	r, err = p.accessLog.ReadRequest()
+	r, err := p.accessLog.ReadRequest()
 	if err != nil && err != io.EOF {
 		p.options.Log.Warnln("error while reading access log:", err)
-		return r, err
+		return nil, err
 	}
 
 	if err == io.EOF {
 		p.accessLog = nil
-		return r, errAccessLogEOF
+		return p.nextRequest(position)
 	}
 
 	p.logEntries = append(p.logEntries, r)
-	r = p.accessLogContentSettings(r)
-	p.position++
+	p.contentSettings(r)
 	return r, nil
-}
-
-func (p *Player) createHTTPRequest(r Request) (*http.Request, error) {
-	m := r.Method
-	if m == "" {
-		m = "GET"
-	}
-
-	a := p.options.Server
-	if a == "" {
-		if r.Host == "" {
-			a = "http://localhost"
-		} else {
-			a = r.Host
-		}
-
-		if !strings.HasPrefix(a, "http://") && !strings.HasPrefix(a, "https://") {
-			a = p.options.DefaultScheme + "://" + a
-		}
-	}
-
-	u, err := url.Parse(a)
-	if err != nil {
-		return nil, err
-	}
-
-	if u.Scheme == "" {
-		u.Scheme = "http"
-	}
-
-	u.Path = r.Path
-
-	hasContent := r.ContentLength > 0 || r.ContentLengthDeviation > 0
-	var (
-		body          io.ReadCloser
-		contentLength int
-	)
-
-	if hasContent {
-		contentLength = deviateMin(r.ContentLength, r.ContentLengthDeviation)
-		body = ioutil.NopCloser(randomText(contentLength))
-	}
-
-	hr, err := http.NewRequest(m, u.String(), body)
-	if err != nil {
-		return nil, err
-	}
-
-	if hasContent && r.SetContentLength {
-		hr.ContentLength = int64(contentLength)
-	}
-
-	h := r.Host
-	if h == "" {
-		h = p.options.Server
-	}
-
-	if h == "" {
-		h = "localhost"
-	}
-
-	hr.Host = h
-
-	return hr, nil
-}
-
-func (p *Player) sendRequest(r Request) error {
-	hr, err := p.createHTTPRequest(r)
-	if err != nil {
-		p.options.Log.Errorln("failed to create request", err)
-		return err
-	}
-
-	rsp, err := p.client.Do(hr)
-	if err != nil {
-		p.options.Log.Warnln("error while making request:", err)
-		return err
-	}
-
-	defer rsp.Body.Close()
-
-	if rsp.StatusCode >= http.StatusInternalServerError {
-		return ErrServerError
-	}
-
-	_, err = ioutil.ReadAll(rsp.Body)
-	if err != nil {
-		p.options.Log.Warnln("error while reading request body:", err)
-		return err
-	}
-
-	return nil
 }
 
 func (p *Player) checkHaltError() bool {
@@ -420,17 +302,64 @@ func (p *Player) checkHaltStatus() bool {
 func (p *Player) run() {
 	var (
 		once         bool
-		running      signalChannel
 		waiting      []signalChannel
 		waitingError []errorChannel
+		requests     chan requestRequest
 	)
 
-	letRun := make(signalChannel)
-	close(letRun)
+	receiveRequests := make(chan requestRequest)
+	receiveErrors := make(errorChannel)
+	players := make([]*player, p.options.ConcurrentSessions)
+	for i := 0; i < p.options.ConcurrentSessions; i++ {
+		players[i] = newPlayer(p.options, receiveRequests, receiveErrors)
+		go players[i].run()
+	}
+
+	stopPlayer := func(i int, receive requestChannel) {
+		if i < 0 {
+			for i = 0; i < len(players); i++ {
+				if players[i].receive == receive {
+					break
+				}
+			}
+		}
+
+		if i >= len(players) {
+			return
+		}
+
+		close(players[i].receive)
+		players = append(players[:i], players[i+1:]...)
+	}
+
+	checkError := func(err error) error {
+		switch err {
+		case nil:
+			p.errors = 0
+			p.serverErrors = 0
+		case ErrNoRequests:
+			return ErrNoRequests
+		case ErrServerError:
+			p.serverErrors++
+			if p.checkHaltStatus() {
+				return ErrServerError
+			}
+		default:
+			p.errors++
+			if p.checkHaltError() {
+				return ErrRequestError
+			}
+		}
+
+		return nil
+	}
 
 	stop := func(err error) {
-		p.position = 0
-		p.notRunning <- token
+		err = checkError(err)
+
+		for i := range players {
+			stopPlayer(i, nil)
+		}
 
 		for _, w := range waitingError {
 			w <- err
@@ -439,6 +368,18 @@ func (p *Player) run() {
 		for _, w := range waiting {
 			close(w)
 		}
+
+		p.notRunning <- token
+	}
+
+	checkHalt := func(err error) bool {
+		err = checkError(err)
+		if err == nil {
+			return false
+		}
+
+		stop(err)
+		return true
 	}
 
 	for {
@@ -446,58 +387,55 @@ func (p *Player) run() {
 		case d := <-p.signalPlay:
 			waitingError = append(waitingError, d)
 			once = false
-			running = letRun
+			requests = receiveRequests
 		case d := <-p.signalOnce:
 			waitingError = append(waitingError, d)
 			once = true
-			running = letRun
+			requests = receiveRequests
 		case d := <-p.signalPause:
-			running = nil
+			requests = nil
 			close(d)
-			continue
 		case d := <-p.signalStop:
 			stop(nil)
 			close(d)
 			return
-		case <-running:
-			r, err := p.nextRequest()
+		case err := <-receiveErrors:
+			if checkHalt(err) {
+				return
+			}
+		case rr := <-requests:
+			r, err := p.nextRequest(rr.position)
 			if err == io.EOF {
 				if once {
-					stop(nil)
-					return
+					stopPlayer(-1, rr.response)
+					if len(players) == 0 {
+						stop(nil)
+						return
+					}
+
+					continue
 				}
 
-				if p.position == 0 {
+				if rr.position == 0 {
 					stop(ErrNoRequests)
 					return
 				}
 
-				p.position = 0
+				rr.response <- nil
 				continue
 			}
 
-			if err == nil {
-				err = p.sendRequest(r)
+			if err != nil {
+				if checkHalt(err) {
+					return
+				}
+
+				continue
 			}
 
-			switch err {
-			case nil:
-				p.errors = 0
-				p.serverErrors = 0
-			case errAccessLogEOF:
-			case ErrServerError:
-				p.serverErrors++
-				if p.checkHaltStatus() {
-					stop(err)
-					return
-				}
-			default:
-				p.errors++
-				if p.checkHaltError() {
-					stop(ErrReqeustError)
-					return
-				}
-			}
+			var rc Request
+			rc = *r
+			rr.response <- &rc
 		}
 	}
 }
