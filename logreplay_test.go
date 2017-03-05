@@ -105,7 +105,7 @@ func (l *limitHandler) ServeHTTP(http.ResponseWriter, *http.Request) {
 	defer l.mx.Unlock()
 	l.limit--
 	if l.limit == 0 {
-		l.notify <- token
+		l.notify <- signalToken{}
 	}
 }
 
@@ -475,7 +475,7 @@ func test(t *testing.T, concurrency int) {
 				t.Error(err)
 			}
 
-			done <- token
+			done <- signalToken{}
 		}()
 
 		select {

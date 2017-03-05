@@ -8,26 +8,26 @@ import (
 	"strings"
 )
 
-type requestRequest struct {
+type feedRequest struct {
 	position int
 	response requestChannel
 }
 
 type player struct {
-	options      Options
-	sendRequests chan requestRequest
-	sendErrors   errorChannel
-	receive      requestChannel
-	position     int
-	client       *http.Client
+	options     Options
+	requestFeed chan feedRequest
+	results     errorChannel
+	feed        requestChannel
+	position    int
+	client      *http.Client
 }
 
-func newPlayer(o Options, sendRequests chan requestRequest, sendErrors errorChannel) *player {
+func newPlayer(o Options, requestFeed chan feedRequest, results errorChannel) *player {
 	p := &player{
-		options:      o,
-		sendRequests: sendRequests,
-		sendErrors:   sendErrors,
-		receive:      make(requestChannel),
+		options:     o,
+		requestFeed: requestFeed,
+		results:     results,
+		feed:        make(requestChannel),
 	}
 
 	p.client = &http.Client{
@@ -148,11 +148,11 @@ func (p *player) sendRequest(r *Request) error {
 func (p *player) run() {
 	for {
 		select {
-		case p.sendRequests <- requestRequest{
+		case p.requestFeed <- feedRequest{
 			position: p.position,
-			response: p.receive,
+			response: p.feed,
 		}:
-		case r, open := <-p.receive:
+		case r, open := <-p.feed:
 			if !open {
 				return
 			}
@@ -164,7 +164,7 @@ func (p *player) run() {
 
 			p.position++
 			err := p.sendRequest(r)
-			p.sendErrors <- err
+			p.results <- err
 		}
 	}
 }

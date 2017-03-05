@@ -174,6 +174,9 @@ type Player struct {
 	customRequests []*Request
 	errors         int
 	serverErrors   int
+	players        []*player
+	once           bool
+	waitingError   []errorChannel
 	notRunning     signalChannel
 	signalPlay     chan errorChannel
 	signalOnce     chan errorChannel
@@ -191,8 +194,6 @@ var (
 
 	// ErrNoRequests is returned when the there are no requests to be executed by Play().
 	ErrNoRequests = errors.New("no requests to play")
-
-	token = signalToken{}
 )
 
 // New initialzies a player.
@@ -220,9 +221,9 @@ func New(o Options) (*Player, error) {
 
 	// enable starting the player:
 	notRunning := make(signalChannel, 1)
-	notRunning <- token
+	notRunning <- signalToken{}
 
-	p := &Player{
+	return &Player{
 		options:        o,
 		accessLog:      r,
 		customRequests: o.Requests,
@@ -231,9 +232,7 @@ func New(o Options) (*Player, error) {
 		signalOnce:     make(chan errorChannel, 1),
 		signalPause:    make(chan signalChannel, 1),
 		signalStop:     make(chan signalChannel, 1),
-	}
-
-	return p, nil
+	}, nil
 }
 
 func (p *Player) contentSettings(r *Request) {
@@ -299,143 +298,141 @@ func (p *Player) checkHaltStatus() bool {
 	return true
 }
 
-func (p *Player) run() {
-	var (
-		once         bool
-		waiting      []signalChannel
-		waitingError []errorChannel
-		requests     chan requestRequest
-	)
-
-	receiveRequests := make(chan requestRequest)
-	receiveErrors := make(errorChannel)
-	players := make([]*player, p.options.ConcurrentSessions)
-	for i := 0; i < p.options.ConcurrentSessions; i++ {
-		players[i] = newPlayer(p.options, receiveRequests, receiveErrors)
-		go players[i].run()
+func (p *Player) checkHalt(err error) bool {
+	err = p.checkError(err)
+	if err == nil {
+		return false
 	}
 
-	stopPlayer := func(i int, receive requestChannel) {
-		if i < 0 {
-			for i = 0; i < len(players); i++ {
-				if players[i].receive == receive {
-					break
-				}
+	p.stop(err)
+	return true
+}
+
+func (p *Player) checkError(err error) error {
+	switch err {
+	case nil:
+		p.errors = 0
+		p.serverErrors = 0
+	case ErrNoRequests:
+		return ErrNoRequests
+	case ErrServerError:
+		p.serverErrors++
+		if p.checkHaltStatus() {
+			return ErrServerError
+		}
+	default:
+		p.errors++
+		if p.checkHaltError() {
+			return ErrRequestError
+		}
+	}
+
+	return nil
+}
+
+func (p *Player) stopPlayer(i int, feed requestChannel) {
+	if i < 0 {
+		for i = 0; i < len(p.players); i++ {
+			if p.players[i].feed == feed {
+				break
 			}
 		}
-
-		if i >= len(players) {
-			return
-		}
-
-		close(players[i].receive)
-		players = append(players[:i], players[i+1:]...)
 	}
 
-	checkError := func(err error) error {
-		switch err {
-		case nil:
-			p.errors = 0
-			p.serverErrors = 0
-		case ErrNoRequests:
-			return ErrNoRequests
-		case ErrServerError:
-			p.serverErrors++
-			if p.checkHaltStatus() {
-				return ErrServerError
+	if i >= len(p.players) {
+		return
+	}
+
+	close(p.players[i].feed)
+	p.players = append(p.players[:i], p.players[i+1:]...)
+}
+
+func (p *Player) stop(err error) {
+	for i := range p.players {
+		p.stopPlayer(i, nil)
+	}
+
+	err = p.checkError(err)
+	for _, w := range p.waitingError {
+		w <- err
+	}
+
+	p.notRunning <- signalToken{}
+}
+
+func (p *Player) feedRequest(f feedRequest) bool {
+	r, err := p.nextRequest(f.position)
+	if err == io.EOF {
+		if p.once {
+			p.stopPlayer(-1, f.response)
+			if len(p.players) == 0 {
+				p.stop(nil)
+				return false
 			}
-		default:
-			p.errors++
-			if p.checkHaltError() {
-				return ErrRequestError
-			}
+
+			return true
 		}
 
-		return nil
-	}
-
-	stop := func(err error) {
-		err = checkError(err)
-
-		for i := range players {
-			stopPlayer(i, nil)
-		}
-
-		for _, w := range waitingError {
-			w <- err
-		}
-
-		for _, w := range waiting {
-			close(w)
-		}
-
-		p.notRunning <- token
-	}
-
-	checkHalt := func(err error) bool {
-		err = checkError(err)
-		if err == nil {
+		if f.position == 0 {
+			p.stop(ErrNoRequests)
 			return false
 		}
 
-		stop(err)
+		f.response <- nil
 		return true
 	}
 
+	if err != nil {
+		if p.checkHalt(err) {
+			return false
+		}
+
+		return true
+	}
+
+	var rc Request
+	rc = *r
+	f.response <- &rc
+	return true
+}
+
+func (p *Player) run() {
+	requestFeed := make(chan feedRequest)
+	results := make(errorChannel)
+	p.waitingError = nil
+
+	p.players = make([]*player, p.options.ConcurrentSessions)
+	for i := 0; i < p.options.ConcurrentSessions; i++ {
+		p.players[i] = newPlayer(p.options, requestFeed, results)
+		go p.players[i].run()
+	}
+
+	var feed chan feedRequest
 	for {
 		select {
 		case d := <-p.signalPlay:
-			waitingError = append(waitingError, d)
-			once = false
-			requests = receiveRequests
+			p.waitingError = append(p.waitingError, d)
+			p.once = false
+			feed = requestFeed
 		case d := <-p.signalOnce:
-			waitingError = append(waitingError, d)
-			once = true
-			requests = receiveRequests
+			p.waitingError = append(p.waitingError, d)
+			p.once = true
+			feed = requestFeed
 		case d := <-p.signalPause:
-			requests = nil
+			feed = nil
 			close(d)
 		case d := <-p.signalStop:
-			stop(nil)
+			p.stop(nil)
 			close(d)
 			return
-		case err := <-receiveErrors:
-			if checkHalt(err) {
+		case err := <-results:
+			if p.checkHalt(err) {
 				return
 			}
-		case rr := <-requests:
-			r, err := p.nextRequest(rr.position)
-			if err == io.EOF {
-				if once {
-					stopPlayer(-1, rr.response)
-					if len(players) == 0 {
-						stop(nil)
-						return
-					}
-
-					continue
-				}
-
-				if rr.position == 0 {
-					stop(ErrNoRequests)
-					return
-				}
-
-				rr.response <- nil
-				continue
+		case f := <-feed:
+			if !p.feedRequest(f) {
+				return
 			}
-
-			if err != nil {
-				if checkHalt(err) {
-					return
-				}
-
-				continue
-			}
-
-			var rc Request
-			rc = *r
-			rr.response <- &rc
 		}
 	}
 }
