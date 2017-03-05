@@ -147,6 +147,9 @@ type Options struct {
 	// a request taken from the access log can differ from PostContentLength.
 	PostContentLengthDeviation float64
 
+	// PostContentChunked defines whether request content should be sent chunked.
+	PostContentChunked bool
+
 	// Log defines a custom logger for the player.
 	Log Logger
 
@@ -252,10 +255,25 @@ func (p *Player) checkRedirect(rn *http.Request, rp []*http.Request) error {
 	}
 }
 
+func (p *Player) accessLogContentSettings(r Request) Request {
+	switch r.Method {
+	case "POST", "PUT", "PATCH":
+	default:
+		return r
+	}
+
+	r.ContentLength = p.options.PostContentLength
+	r.ContentLengthDeviation = p.options.PostContentLengthDeviation
+	r.Chunked = p.options.PostContentChunked
+
+	return r
+}
+
 func (p *Player) nextRequest() (Request, error) {
 	var r Request
 	if p.position < len(p.logEntries) {
 		r = p.logEntries[p.position]
+		r = p.accessLogContentSettings(r)
 		p.position++
 		return r, nil
 	}
@@ -284,6 +302,7 @@ func (p *Player) nextRequest() (Request, error) {
 	}
 
 	p.logEntries = append(p.logEntries, r)
+	r = p.accessLogContentSettings(r)
 	p.position++
 	return r, nil
 }
@@ -318,9 +337,24 @@ func (p *Player) createHTTPRequest(r Request) (*http.Request, error) {
 
 	u.Path = r.Path
 
-	hr, err := http.NewRequest(m, u.String(), nil)
+	hasContent := r.ContentLength > 0 || r.ContentLengthDeviation > 0
+	var (
+		body          io.ReadCloser
+		contentLength int
+	)
+
+	if hasContent {
+		contentLength = deviateMin(r.ContentLength, r.ContentLengthDeviation)
+		body = ioutil.NopCloser(randomText(contentLength))
+	}
+
+	hr, err := http.NewRequest(m, u.String(), body)
 	if err != nil {
 		return nil, err
+	}
+
+	if hasContent && !r.Chunked {
+		hr.ContentLength = int64(contentLength)
 	}
 
 	h := r.Host

@@ -3,6 +3,7 @@ package logreplay
 import (
 	"encoding/json"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -29,6 +30,8 @@ type slowMotionHandler struct {
 type redirectHandler struct {
 	location string
 }
+
+type contentLengthHandler int
 
 type logReader struct {
 	text string
@@ -89,6 +92,16 @@ func (rh *redirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusFound)
 }
 
+func (c *contentLengthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	b, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	*c += contentLengthHandler(len(b))
+}
+
 func chainHandlers(h ...http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		for _, hi := range h {
@@ -126,6 +139,18 @@ func (p *testJSONParser) Parse(line string) Request {
 	return req
 }
 
+func play(t *testing.T, p *Player) {
+	if err := p.Play(); err != nil {
+		t.Error(err)
+	}
+}
+
+func once(t *testing.T, p *Player) {
+	if err := p.Once(); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestReplayAccessLog(t *testing.T) {
 	const accessLog = `
 1.2.3.4, 5.6.7.8, 9.0.1.2 - - [02/Mar/2017:11:43:00 +0000] "GET /foo HTTP/1.1" 200 566 "https://www.example.org/bar.html", "Mozilla/5.0 (iPhone; CPU iPHone OS 10_2_1 like Mac OS X) AppleWebKit/600.1.4 (KHTML, like Gecko) GSA/23.0.1234 Mobile/14D27 Safari/600.1.4" 1 www.example.org
@@ -146,7 +171,11 @@ func TestReplayAccessLog(t *testing.T) {
 		return
 	}
 
-	p.Once()
+	err = p.Once()
+	if err != nil {
+		t.Error(err)
+	}
+
 	rh.check(t, [][]string{{
 		"GET", "www.example.org", "/foo",
 	}, {
@@ -174,7 +203,11 @@ func TestReplayBlank(t *testing.T) {
 		return
 	}
 
-	p.Once()
+	err = p.Once()
+	if err != nil {
+		t.Error(err)
+	}
+
 	if c != requestCount {
 		t.Error("replaying requests failed", c, requestCount)
 	}
@@ -204,7 +237,11 @@ GET /bar www.example.org
 		return
 	}
 
-	p.Once()
+	err = p.Once()
+	if err != nil {
+		t.Error(err)
+	}
+
 	rh.check(t, [][]string{{
 		"GET", "www.example.org", "/foo",
 	}, {
@@ -239,7 +276,11 @@ func TestCustomParser(t *testing.T) {
 		return
 	}
 
-	p.Once()
+	err = p.Once()
+	if err != nil {
+		t.Error(err)
+	}
+
 	rh.check(t, [][]string{{
 		"GET", "www.example.org", "/foo",
 	}, {
@@ -275,7 +316,7 @@ GET /bar www.example.org
 		return
 	}
 
-	go p.Play()
+	go play(t, p)
 
 	select {
 	case <-notify:
@@ -337,9 +378,9 @@ GET /bar www.example.org
 		return
 	}
 
-	go p.Play()
+	go play(t, p)
 	p.Stop()
-	go p.Play()
+	go play(t, p)
 
 	<-notify
 	p.Stop()
@@ -358,7 +399,11 @@ func TestDoesNotFollowRedirects(t *testing.T) {
 
 	done := make(signalChannel)
 	go func() {
-		p.Once()
+		err := p.Once()
+		if err != nil {
+			t.Error(err)
+		}
+
 		done <- token
 	}()
 
@@ -402,7 +447,9 @@ func TestFollowSameHostOnly(t *testing.T) {
 		return
 	}
 
+	// ignoring errors:
 	go p.Once()
+
 	<-notify
 
 	if c1 != 0 || c2 != 1 || c3 != 2 {
@@ -432,7 +479,11 @@ func TestFollowRedirect(t *testing.T) {
 		return
 	}
 
-	p.Once()
+	err = p.Once()
+	if err != nil {
+		t.Error(err)
+	}
+
 	if c1 != 1 || c2 != 1 {
 		t.Error("failed to apply redirect behavior", c1, c2)
 	}
@@ -521,5 +572,30 @@ func TestStopsOn5xxInOnce(t *testing.T) {
 	err = p.Once()
 	if err != ErrServerError {
 		t.Error("failed to fail with the right error", err)
+	}
+}
+
+func TestRequestWithContent(t *testing.T) {
+	var cl contentLengthHandler
+	s := httptest.NewServer(&cl)
+	defer s.Close()
+
+	p, err := New(Options{
+		Requests: []Request{{
+			ContentLength:          500,
+			ContentLengthDeviation: 0.1,
+		}},
+		Server: s.URL,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	once(t, p)
+
+	if cl < 450 || cl > 550 {
+		t.Error("failed to send the right content", cl)
 	}
 }
