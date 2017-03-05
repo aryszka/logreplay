@@ -1,12 +1,11 @@
 // Package logreplay provides a client that can replay HTTP requests based access logs.
 //
-// The player can replay the requests once or infinitely in a loop. It can pause or
-// reset the scenario. It can replay the scenario with a concurrency level of choice.
+// The player can replay the request scenario once or infinitely in a loop. It can pause
+// or reset the scenario. It can replay the scenario with a concurrency level of choice.
 // The player accepts custom request definitions besides or instead of the access log
 // input.
 //
-// The player is provided as an embeddable library, and a simple command is provided as
-// subpackage.
+// The player is provided as an embeddable library, extended with a simple command.
 package logreplay
 
 import (
@@ -181,6 +180,11 @@ type Options struct {
 	Throttle float64
 }
 
+type (
+	signalToken   struct{}
+	signalChannel chan signalToken
+)
+
 // Player replays HTTP requests explicitly specified and/or read from an Apache access log.
 type Player struct {
 	options      Options
@@ -190,9 +194,18 @@ type Player struct {
 	client       *http.Client
 	errors       int
 	serverErrors int
+	notRunning   signalChannel
+	signalPlay   chan signalChannel
+	signalOnce   chan signalChannel
+	signalPause  chan signalChannel
+	signalStop   chan signalChannel
 }
 
-var errServerStatus = errors.New("unexpected server status")
+var (
+	errServerStatus = errors.New("unexpected server status")
+	errAccessLogEOF = errors.New("access log EOF")
+	token           = signalToken{}
+)
 
 // New initialzies a player.
 func New(o Options) (*Player, error) {
@@ -209,42 +222,43 @@ func New(o Options) (*Player, error) {
 		}
 	}
 
+	notRunning := make(signalChannel, 1)
+	notRunning <- token
 	return &Player{
-		options:   o,
-		accessLog: r,
-		requests:  o.Requests,
-		client:    &http.Client{Transport: &http.Transport{}},
+		options:     o,
+		accessLog:   r,
+		requests:    o.Requests,
+		client:      &http.Client{Transport: &http.Transport{}},
+		notRunning:  notRunning,
+		signalPlay:  make(chan signalChannel),
+		signalOnce:  make(chan signalChannel),
+		signalPause: make(chan signalChannel),
+		signalStop:  make(chan signalChannel),
 	}, nil
 }
 
-func (p *Player) nextRequest() (Request, bool) {
+func (p *Player) nextRequest() (Request, error) {
 	var r Request
 	if p.accessLog == nil {
 		if p.position >= len(p.requests) {
-			return r, false
+			return r, io.EOF
 		}
 
 		r = p.requests[p.position]
 		p.position++
-		return r, true
+		return r, nil
 	}
 
 	var err error
 	r, err = p.accessLog.ReadRequest()
 	if err != nil && err != io.EOF {
 		p.options.Log.Warnln("error while reading access log:", err)
-
-		p.errors++
-		if p.checkHaltError() {
-			return r, false
-		}
-
-		return p.nextRequest()
+		return r, err
 	}
 
 	if err == io.EOF {
 		p.accessLog = nil
-		return p.nextRequest()
+		return r, errAccessLogEOF
 	}
 
 	p.requests = append(
@@ -256,7 +270,7 @@ func (p *Player) nextRequest() (Request, bool) {
 	)
 
 	p.position++
-	return r, true
+	return r, nil
 }
 
 func (p *Player) createHTTPRequest(r Request) (*http.Request, error) {
@@ -332,9 +346,9 @@ func (p *Player) sendRequest(r Request) error {
 	return nil
 }
 
-func (p *Player) checkHaltError() bool {
+func (p *Player) checkHaltError() {
 	if p.errors < p.options.HaltThreshold {
-		return false
+		return
 	}
 
 	p.options.Log.Errorln("request errors exceeded threshold")
@@ -342,18 +356,14 @@ func (p *Player) checkHaltError() bool {
 	switch p.options.HaltPolicy {
 	case StopOnError, StopOn500:
 		p.Stop()
-		return true
 	case PauseOnError, PauseOn500:
 		p.Pause()
-		return true
 	}
-
-	return false
 }
 
-func (p *Player) checkHaltStatus() bool {
+func (p *Player) checkHaltStatus() {
 	if p.serverErrors < p.options.HaltThreshold {
-		return false
+		return
 	}
 
 	p.options.Log.Errorln("server errors exceeded threshold")
@@ -361,55 +371,134 @@ func (p *Player) checkHaltStatus() bool {
 	switch p.options.HaltPolicy {
 	case StopOn500:
 		p.Stop()
-		return true
 	case PauseOn500:
 		p.Pause()
-		return true
+	}
+}
+
+// TODO: panic if no requests at all
+
+func (p *Player) run() {
+	var (
+		once    bool
+		running signalChannel
+		waiting []signalChannel
+	)
+
+	letRun := make(signalChannel)
+	close(letRun)
+
+	stop := func() {
+		p.position = 0
+		p.notRunning <- token
+		for _, w := range waiting {
+			close(w)
+		}
 	}
 
-	return false
+	for {
+		select {
+		case d := <-p.signalPlay:
+			waiting = append(waiting, d)
+			once = false
+			running = letRun
+		case d := <-p.signalOnce:
+			waiting = append(waiting, d)
+			once = true
+			running = letRun
+		case d := <-p.signalPause:
+			running = nil
+			close(d)
+			continue
+		case d := <-p.signalStop:
+			stop()
+			close(d)
+			return
+		case <-running:
+			r, err := p.nextRequest()
+			if err == io.EOF {
+				if once {
+					stop()
+					return
+				}
+
+				p.position = 0
+				continue
+			}
+
+			if err == nil {
+				err = p.sendRequest(r)
+			}
+
+			switch err {
+			case nil, errAccessLogEOF:
+			case errServerStatus:
+				p.serverErrors++
+				p.checkHaltStatus()
+			default:
+				p.errors++
+				p.checkHaltError()
+			}
+		}
+	}
+}
+
+// this is enough to avoid starting more than one goroutine
+func (p *Player) isRunning() bool {
+	select {
+	case <-p.notRunning:
+		return false
+	default:
+		return true
+	}
+}
+
+func (p *Player) signal(s chan signalChannel) {
+	done := make(signalChannel)
+	s <- done
+	<-done
 }
 
 // Play replays the requests infinitely with the specified concurrency. If an access log is
 // specified it reads it to the end only once, and it repeats the read requests from then on.
 //
-// When the player is currently playing requests, it is a noop.
-func (p *Player) Play() {}
+// When the player is currently playing requests, it is a noop. Play is blocking, in order to
+// use Pause() or Stop(), they need to be called from a different goroutine. To cleanup
+// resources, it must be stopped. Play(), Once() and Pause() can be called any number of times
+// during a session started by Play() or Once().
+func (p *Player) Play() {
+	if !p.isRunning() {
+		go p.run()
+	}
+
+	p.signal(p.signalPlay)
+}
 
 // Once replays the requests once.
 //
-// When the player is currently playing requests, it is a noop.
+// When the player is currently playing requests, it is a noop. Once is blocking, in order to
+// use Pause() or Stop(), they need to be called from a different goroutine. To cleanup
+// resources, it must run to the end, or it must be stopped. Play(), Once() and Pause() can be
+// called any number of times during a session started by Play() or Once().
 func (p *Player) Once() {
-	for {
-		r, ok := p.nextRequest()
-		if !ok {
-			break
-		}
-
-		err := p.sendRequest(r)
-		if err == nil {
-			continue
-		}
-
-		switch err {
-		case errServerStatus:
-			p.serverErrors++
-			if p.checkHaltStatus() {
-				break
-			}
-		default:
-			p.errors++
-			if p.checkHaltError() {
-				break
-			}
-		}
+	if !p.isRunning() {
+		go p.run()
 	}
+
+	p.signal(p.signalOnce)
 }
 
 // Pause pauses the replay of the requests. When Play() or Once() are called after pause, the
-// replay is resumed at the next request in order.
-func (p *Player) Pause() {}
+// replay is resumed at the next request in order. It should not be called after Stop(). Play(),
+// Once() and Pause() can be called any number of times during a session started by Play() or
+// Once().
+func (p *Player) Pause() {
+	p.signal(p.signalPause)
+}
 
 // Stop stops the replay of the requests. When Play() or Once() are called after stop, the
-// replay is starts from the first request.
-func (p *Player) Stop() {}
+// replay starts from the first request. It can be called only once after Play() or Once() was
+// called.
+func (p *Player) Stop() {
+	p.signal(p.signalStop)
+}

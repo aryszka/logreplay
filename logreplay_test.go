@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 type statusHandler int
@@ -16,6 +17,11 @@ type recorderHandler struct {
 	recorder
 }
 
+type limitHandler struct {
+	limit  int
+	notify chan<- struct{}
+}
+
 type logReader struct {
 	text string
 }
@@ -24,7 +30,9 @@ type testJSONParser struct {
 	test *testing.T
 }
 
-var ok = statusHandler(http.StatusOK)
+var (
+	ok = statusHandler(http.StatusOK)
+)
 
 func init() {
 	enableDebugLog()
@@ -54,6 +62,13 @@ func (r *recorderHandler) check(t *testing.T, expected [][]string) {
 				t.Error("unexpected log entry", i, j, r.logs[i][j+1], lij)
 			}
 		}
+	}
+}
+
+func (l *limitHandler) ServeHTTP(http.ResponseWriter, *http.Request) {
+	l.limit--
+	if l.limit == 0 {
+		l.notify <- token
 	}
 }
 
@@ -207,4 +222,41 @@ func TestCustomParser(t *testing.T) {
 	}, {
 		"GET", "www.example.org", "/bar",
 	}})
+}
+
+func TestInfiniteLoop(t *testing.T) {
+	const logs = `
+GET /foo www.example.org
+POST /api/foo api.example.org
+GET /bar www.example.org
+	`
+
+	const format = `^(?P<method>\S+)\s+(?P<path>\S+)\s+(?P<host>\S+)$`
+
+	notify := make(chan struct{})
+
+	lh := &limitHandler{limit: 12, notify: notify}
+	s := httptest.NewServer(lh)
+	defer s.Close()
+
+	p, err := New(Options{
+		AccessLog:       &logReader{logs},
+		AccessLogFormat: format,
+		Server:          s.URL,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	go p.Play()
+
+	select {
+	case <-notify:
+	case <-time.After(120 * time.Millisecond):
+		t.Error("timeout")
+	}
+
+	p.Stop()
 }
