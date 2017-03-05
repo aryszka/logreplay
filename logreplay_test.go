@@ -293,7 +293,7 @@ func TestErrorOnNoRequests(t *testing.T) {
 		return
 	}
 
-	if p.Play() == nil {
+	if p.Play() != ErrNoRequests {
 		t.Error("failed to fail")
 	}
 }
@@ -435,5 +435,91 @@ func TestFollowRedirect(t *testing.T) {
 	p.Once()
 	if c1 != 1 || c2 != 1 {
 		t.Error("failed to apply redirect behavior", c1, c2)
+	}
+}
+
+func TestStopsOnError(t *testing.T) {
+	s := httptest.NewServer(statusHandler(http.StatusOK))
+	s.Close()
+
+	p, err := New(Options{
+		Requests:      []Request{{}},
+		Server:        s.URL,
+		HaltThreshold: 3,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	err = p.Play()
+	if err != ErrReqeustError {
+		t.Error("failed to fail with the right error", err)
+	}
+}
+
+func TestStopsOn5xx(t *testing.T) {
+	s := httptest.NewServer(statusHandler(http.StatusInternalServerError))
+	defer s.Close()
+
+	p, err := New(Options{
+		Requests:      []Request{{}},
+		Server:        s.URL,
+		HaltThreshold: 3,
+		HaltOn500:     true,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	err = p.Play()
+	if err != ErrServerError {
+		t.Error("failed to fail with the right error", err)
+	}
+}
+
+func TestStopsOnErrorInOnce(t *testing.T) {
+	s := httptest.NewServer(statusHandler(http.StatusOK))
+	s.Close()
+
+	p, err := New(Options{
+		Requests:      []Request{{}, {}, {}},
+		Server:        s.URL,
+		HaltThreshold: 2,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	err = p.Once()
+	if err != ErrReqeustError {
+		t.Error("failed to fail with the right error", err)
+	}
+}
+
+func TestStopsOn5xxInOnce(t *testing.T) {
+	s := httptest.NewServer(statusHandler(http.StatusInternalServerError))
+	defer s.Close()
+
+	p, err := New(Options{
+		Requests:      []Request{{}, {}, {}},
+		Server:        s.URL,
+		HaltThreshold: 3,
+		HaltOn500:     true,
+	})
+
+	if err != nil {
+		t.Error(err)
+		return
+	}
+
+	err = p.Once()
+	if err != ErrServerError {
+		t.Error("failed to fail with the right error", err)
 	}
 }

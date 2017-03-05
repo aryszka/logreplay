@@ -1,9 +1,14 @@
-// Package logreplay provides a client that can replay HTTP requests based access logs.
+// Package logreplay provides a client that can replay HTTP requests based on access logs.
 //
-// The player can replay the request scenario once or infinitely in a loop. It can pause
-// or reset the scenario. It can replay the scenario with a concurrency level of choice.
-// The player accepts custom request definitions besides or instead of the access log
-// input.
+// The player can replay a scenario only once, or infinitely in a loop. It can
+// pause or reset. It can replay the scenario with a concurrency level of
+// choice. The player accepts custom request definitions besides or instead of the access
+// log input. It supports custom format for the built-in parser, or a complete custom
+// parser. It gives control over the target network address by allowing to use a proxy
+// server or making requests directly to the hosts defined in the access log. Other
+// features: control over the redirect behavior, sending varying content with POST/PUT/
+// PATCH requests, controlling error behavior, artificially throttling request rate. For
+// details about controlling the replay, see the documentation of the Options type.
 //
 // The player is provided as an embeddable library, extended with a simple command line
 // wrapper.
@@ -33,28 +38,6 @@ const (
 	// FollowRedirect tells the player to follow all redirects. (Not recommended
 	// during load tests.)
 	FollowRedirect
-)
-
-// HaltPolicy defines whether to halt on failed requests. It is used in combination
-// with HaltThreshold.
-type HaltPolicy int
-
-const (
-
-	// PauseOnError tells the player to pause requests when an error occurs.
-	PauseOnError HaltPolicy = iota
-
-	// StopOnError tells the player to stop requests when an error occurs.
-	StopOnError
-
-	// PauseOn500 tells the player to pause requests when an error or a 500 response occurs.
-	PauseOn500
-
-	// StopOn500 tells the player to stop requests when an error or a 500 response occurs.
-	StopOn500
-
-	// NoHalt tells the player to ignore all request errors and 500s.
-	NoHalt
 )
 
 const defaultHaltThreshold = 1 << 7
@@ -167,12 +150,11 @@ type Options struct {
 	// Log defines a custom logger for the player.
 	Log Logger
 
-	// HaltPolicy tells the player what to do in case an error or a 500 response occurs.
-	// The default is to pause on errors (500s ignored).
-	HaltPolicy HaltPolicy
+	// HaltOn500 tells the player to stop not only on errors but on server errors, too.
+	HaltOn500 bool
 
-	// HaltThreshold tells the player after how many errors or 500s it should apply the
-	// HaltPolicy. Default: 128.
+	// HaltThreshold tells the player after how many errors or 500s it should stop.
+	// Default: 128.
 	HaltThreshold int
 
 	// Throttle maximizes the outgoing overall request per second rate.
@@ -197,15 +179,23 @@ type Player struct {
 	serverErrors   int
 	notRunning     signalChannel
 	signalPlay     chan errorChannel
-	signalOnce     chan signalChannel
+	signalOnce     chan errorChannel
 	signalPause    chan signalChannel
 	signalStop     chan signalChannel
 }
 
 var (
-	errServerStatus = errors.New("unexpected server status")
+	// ErrServerError is returned when the server responded with 5xx multiple times in
+	// a row.
+	ErrServerError = errors.New("server error")
+
+	// ErrReqeustError is returned when the request failed multiple times in a row.
+	ErrReqeustError = errors.New("request failed")
+
+	// ErrNoRequests is returned when the there are no requests to be executed by Play().
+	ErrNoRequests = errors.New("no requests to play")
+
 	errAccessLogEOF = errors.New("access log EOF")
-	errNoRequests   = errors.New("no requests to play")
 	token           = signalToken{}
 )
 
@@ -237,10 +227,10 @@ func New(o Options) (*Player, error) {
 		customRequests: o.Requests,
 		client:         &http.Client{Transport: &http.Transport{}},
 		notRunning:     notRunning,
-		signalPlay:     make(chan errorChannel),
-		signalOnce:     make(chan signalChannel),
-		signalPause:    make(chan signalChannel),
-		signalStop:     make(chan signalChannel),
+		signalPlay:     make(chan errorChannel, 1),
+		signalOnce:     make(chan errorChannel, 1),
+		signalPause:    make(chan signalChannel, 1),
+		signalStop:     make(chan signalChannel, 1),
 	}
 
 	p.client.CheckRedirect = p.checkRedirect
@@ -363,7 +353,7 @@ func (p *Player) sendRequest(r Request) error {
 	defer rsp.Body.Close()
 
 	if rsp.StatusCode >= http.StatusInternalServerError {
-		return errServerStatus
+		return ErrServerError
 	}
 
 	_, err = ioutil.ReadAll(rsp.Body)
@@ -375,34 +365,22 @@ func (p *Player) sendRequest(r Request) error {
 	return nil
 }
 
-func (p *Player) checkHaltError() {
+func (p *Player) checkHaltError() bool {
 	if p.errors < p.options.HaltThreshold {
-		return
+		return false
 	}
 
 	p.options.Log.Errorln("request errors exceeded threshold")
-
-	switch p.options.HaltPolicy {
-	case StopOnError, StopOn500:
-		p.Stop()
-	case PauseOnError, PauseOn500:
-		p.Pause()
-	}
+	return true
 }
 
-func (p *Player) checkHaltStatus() {
+func (p *Player) checkHaltStatus() bool {
 	if p.serverErrors < p.options.HaltThreshold {
-		return
+		return false
 	}
 
 	p.options.Log.Errorln("server errors exceeded threshold")
-
-	switch p.options.HaltPolicy {
-	case StopOn500:
-		p.Stop()
-	case PauseOn500:
-		p.Pause()
-	}
+	return true
 }
 
 func (p *Player) run() {
@@ -416,12 +394,12 @@ func (p *Player) run() {
 	letRun := make(signalChannel)
 	close(letRun)
 
-	stop := func() {
+	stop := func(err error) {
 		p.position = 0
 		p.notRunning <- token
 
 		for _, w := range waitingError {
-			close(w)
+			w <- err
 		}
 
 		for _, w := range waiting {
@@ -436,7 +414,7 @@ func (p *Player) run() {
 			once = false
 			running = letRun
 		case d := <-p.signalOnce:
-			waiting = append(waiting, d)
+			waitingError = append(waitingError, d)
 			once = true
 			running = letRun
 		case d := <-p.signalPause:
@@ -444,21 +422,20 @@ func (p *Player) run() {
 			close(d)
 			continue
 		case d := <-p.signalStop:
-			stop()
+			stop(nil)
 			close(d)
 			return
 		case <-running:
 			r, err := p.nextRequest()
 			if err == io.EOF {
 				if once {
-					stop()
+					stop(nil)
 					return
 				}
 
 				if p.position == 0 {
-					for _, w := range waitingError {
-						w <- errNoRequests
-					}
+					stop(ErrNoRequests)
+					return
 				}
 
 				p.position = 0
@@ -470,13 +447,22 @@ func (p *Player) run() {
 			}
 
 			switch err {
-			case nil, errAccessLogEOF:
-			case errServerStatus:
+			case nil:
+				p.errors = 0
+				p.serverErrors = 0
+			case errAccessLogEOF:
+			case ErrServerError:
 				p.serverErrors++
-				p.checkHaltStatus()
+				if p.checkHaltStatus() {
+					stop(err)
+					return
+				}
 			default:
 				p.errors++
-				p.checkHaltError()
+				if p.checkHaltError() {
+					stop(ErrReqeustError)
+					return
+				}
 			}
 		}
 	}
@@ -498,6 +484,12 @@ func (p *Player) signal(s chan signalChannel) {
 	<-done
 }
 
+func (p *Player) signalError(s chan errorChannel) error {
+	done := make(errorChannel)
+	s <- done
+	return <-done
+}
+
 // Play replays the requests infinitely with the specified concurrency. If an access log is
 // specified it reads it to the end only once, and it repeats the read requests from then on.
 //
@@ -510,9 +502,7 @@ func (p *Player) Play() error {
 		go p.run()
 	}
 
-	done := make(errorChannel)
-	p.signalPlay <- done
-	return <-done
+	return p.signalError(p.signalPlay)
 }
 
 // Once replays the requests once.
@@ -521,12 +511,12 @@ func (p *Player) Play() error {
 // use Pause() or Stop(), they need to be called from a different goroutine. To cleanup
 // resources, it must run to the end, or it must be stopped. Play(), Once() and Pause() can be
 // called any number of times during a session started by Play() or Once().
-func (p *Player) Once() {
+func (p *Player) Once() error {
 	if !p.isRunning() {
 		go p.run()
 	}
 
-	p.signal(p.signalOnce)
+	return p.signalError(p.signalOnce)
 }
 
 // Pause pauses the replay of the requests. When Play() or Once() are called after pause, the
