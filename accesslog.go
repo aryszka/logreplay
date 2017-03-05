@@ -34,7 +34,7 @@ const defaultFormatExpression = `^` +
 	`("([^"]+)",?\s*)?` +
 
 	// user agent:
-	`("([^"]+)"\s*)?` +
+	`("(?P<useragent>[^"]+)"\s*)?` +
 
 	// duration:
 	`(([0-9]+)\s*)?` +
@@ -65,6 +65,10 @@ func (p *defaultParser) Parse(l string) *Request {
 	r := &Request{}
 	m := p.format.FindStringSubmatch(l)
 	for i, ni := range p.names {
+		if i >= len(m) {
+			break
+		}
+
 		switch ni {
 		case "method":
 			r.Method = m[i]
@@ -72,6 +76,8 @@ func (p *defaultParser) Parse(l string) *Request {
 			r.Host = m[i]
 		case "path":
 			r.Path = m[i]
+		case "useragent":
+			r.UserAgent = m[i]
 		}
 	}
 

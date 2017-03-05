@@ -51,10 +51,10 @@ func (c *client) createHTTPRequest(r *Request) (*http.Request, error) {
 		} else {
 			a = r.Host
 		}
+	}
 
-		if !strings.HasPrefix(a, "http://") && !strings.HasPrefix(a, "https://") {
-			a = c.options.DefaultScheme + "://" + a
-		}
+	if !strings.HasPrefix(a, "http://") && !strings.HasPrefix(a, "https://") {
+		a = c.options.DefaultScheme + "://" + a
 	}
 
 	u, err := url.Parse(a)
@@ -98,6 +98,10 @@ func (c *client) createHTTPRequest(r *Request) (*http.Request, error) {
 	}
 
 	hr.Host = h
+
+	if r.UserAgent != "" {
+		hr.Header.Set("User-Agent", r.UserAgent)
+	}
 
 	return hr, nil
 }

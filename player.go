@@ -35,12 +35,12 @@ func newPlayer(o Options, requestFeed chan feedRequest, results errorChannel) *p
 }
 
 func (p *player) throttle(f func() error) error {
-	start := time.Now()
-	err := f()
 	if p.maxRequestDuration <= 0 {
-		return err
+		return f()
 	}
 
+	start := time.Now()
+	err := f()
 	duration := time.Now().Sub(start)
 
 	throttle := p.maxRequestDuration - duration

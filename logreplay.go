@@ -6,8 +6,8 @@
 // log input. It supports custom format for the built-in parser, or a complete custom
 // parser. It gives control over the target network address by allowing to use a proxy
 // server or making requests directly to the hosts defined in the access log. Other
-// features: control over the redirect behavior, sending varying content with POST/PUT/
-// PATCH requests, controlling error behavior, artificially throttling request rate. For
+// features: control over the redirect behavior, sending varying content with POST/PUT/PATCH
+// requests, controlling error behavior, artificially throttling request rate. For
 // details about controlling the replay, see the documentation of the Options type.
 //
 // The player is provided as an embeddable library, extended with a simple command line
@@ -36,7 +36,9 @@ const (
 	FollowRedirect
 )
 
-const defaultHaltThreshold = 1 << 7
+// DefaultHaltThreshold is the limit that continuous failures need to reach to make the
+// player halt.
+const DefaultHaltThreshold = 1 << 7
 
 // Request describes an individual request made by the player.
 type Request struct {
@@ -51,6 +53,9 @@ type Request struct {
 
 	// Path is set as the HTTP path of the request.
 	Path string
+
+	// UserAgent is set as the HTTP User-Agent header of the request.
+	UserAgent string
 
 	// ContentLength defines the size of the randomly generated request payload.
 	//
