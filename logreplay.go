@@ -5,7 +5,8 @@
 // The player accepts custom request definitions besides or instead of the access log
 // input.
 //
-// The player is provided as an embeddable library, extended with a simple command.
+// The player is provided as an embeddable library, extended with a simple command line
+// wrapper.
 package logreplay
 
 import (
@@ -116,6 +117,9 @@ type Options struct {
 	// where the request host is taken from the last field (following an integer for
 	// duration.)
 	//
+	// On continuous play, the log is read only once, and stored in memory for subsequent
+	// plays. For this reason, the parsed access log must fit in memory.
+	//
 	// Known bugs in the default parser:
 	//
 	// 	- escaped double quotes in the HTTP message not handled
@@ -183,27 +187,30 @@ type Options struct {
 type (
 	signalToken   struct{}
 	signalChannel chan signalToken
+	errorChannel  chan error
 )
 
 // Player replays HTTP requests explicitly specified and/or read from an Apache access log.
 type Player struct {
-	options      Options
-	accessLog    *reader
-	requests     []Request
-	position     int
-	client       *http.Client
-	errors       int
-	serverErrors int
-	notRunning   signalChannel
-	signalPlay   chan signalChannel
-	signalOnce   chan signalChannel
-	signalPause  chan signalChannel
-	signalStop   chan signalChannel
+	options        Options
+	accessLog      *reader
+	logEntries     []Request
+	customRequests []Request
+	position       int
+	client         *http.Client
+	errors         int
+	serverErrors   int
+	notRunning     signalChannel
+	signalPlay     chan errorChannel
+	signalOnce     chan signalChannel
+	signalPause    chan signalChannel
+	signalStop     chan signalChannel
 }
 
 var (
 	errServerStatus = errors.New("unexpected server status")
 	errAccessLogEOF = errors.New("access log EOF")
+	errNoRequests   = errors.New("no requests to play")
 	token           = signalToken{}
 )
 
@@ -224,27 +231,35 @@ func New(o Options) (*Player, error) {
 
 	notRunning := make(signalChannel, 1)
 	notRunning <- token
+
 	return &Player{
-		options:     o,
-		accessLog:   r,
-		requests:    o.Requests,
-		client:      &http.Client{Transport: &http.Transport{}},
-		notRunning:  notRunning,
-		signalPlay:  make(chan signalChannel),
-		signalOnce:  make(chan signalChannel),
-		signalPause: make(chan signalChannel),
-		signalStop:  make(chan signalChannel),
+		options:        o,
+		accessLog:      r,
+		customRequests: o.Requests,
+		client:         &http.Client{Transport: &http.Transport{}},
+		notRunning:     notRunning,
+		signalPlay:     make(chan errorChannel),
+		signalOnce:     make(chan signalChannel),
+		signalPause:    make(chan signalChannel),
+		signalStop:     make(chan signalChannel),
 	}, nil
 }
 
 func (p *Player) nextRequest() (Request, error) {
 	var r Request
+	if p.position < len(p.logEntries) {
+		r = p.logEntries[p.position]
+		p.position++
+		return r, nil
+	}
+
 	if p.accessLog == nil {
-		if p.position >= len(p.requests) {
+		pcustom := p.position - len(p.logEntries)
+		if pcustom >= len(p.customRequests) {
 			return r, io.EOF
 		}
 
-		r = p.requests[p.position]
+		r = p.customRequests[pcustom]
 		p.position++
 		return r, nil
 	}
@@ -261,14 +276,7 @@ func (p *Player) nextRequest() (Request, error) {
 		return r, errAccessLogEOF
 	}
 
-	p.requests = append(
-		p.requests[:p.position],
-		append(
-			[]Request{r},
-			p.requests[p.position:]...,
-		)...,
-	)
-
+	p.logEntries = append(p.logEntries, r)
 	p.position++
 	return r, nil
 }
@@ -376,13 +384,12 @@ func (p *Player) checkHaltStatus() {
 	}
 }
 
-// TODO: panic if no requests at all
-
 func (p *Player) run() {
 	var (
-		once    bool
-		running signalChannel
-		waiting []signalChannel
+		once         bool
+		running      signalChannel
+		waiting      []signalChannel
+		waitingError []errorChannel
 	)
 
 	letRun := make(signalChannel)
@@ -391,6 +398,11 @@ func (p *Player) run() {
 	stop := func() {
 		p.position = 0
 		p.notRunning <- token
+
+		for _, w := range waitingError {
+			close(w)
+		}
+
 		for _, w := range waiting {
 			close(w)
 		}
@@ -399,7 +411,7 @@ func (p *Player) run() {
 	for {
 		select {
 		case d := <-p.signalPlay:
-			waiting = append(waiting, d)
+			waitingError = append(waitingError, d)
 			once = false
 			running = letRun
 		case d := <-p.signalOnce:
@@ -420,6 +432,12 @@ func (p *Player) run() {
 				if once {
 					stop()
 					return
+				}
+
+				if p.position == 0 {
+					for _, w := range waitingError {
+						w <- errNoRequests
+					}
 				}
 
 				p.position = 0
@@ -471,7 +489,11 @@ func (p *Player) Play() {
 		go p.run()
 	}
 
-	p.signal(p.signalPlay)
+	done := make(errorChannel)
+	p.signalPlay <- done
+	if err := <-done; err != nil {
+		panic(err)
+	}
 }
 
 // Once replays the requests once.
