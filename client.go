@@ -47,7 +47,7 @@ func (c *client) createHTTPRequest(r *Request) (*http.Request, error) {
 	a := c.options.Server
 	if a == "" {
 		if r.Host == "" {
-			a = "http://localhost"
+			a = "localhost"
 		} else {
 			a = r.Host
 		}

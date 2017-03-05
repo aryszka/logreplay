@@ -1,9 +1,6 @@
 package logreplay
 
-import (
-	"fmt"
-	"github.com/sirupsen/logrus"
-)
+import "github.com/sirupsen/logrus"
 
 // TODO: fill up the interface with the complete set of standard log functions
 
@@ -16,42 +13,10 @@ type Logger interface {
 	Debugf(string, ...interface{})
 }
 
-type recorder struct {
-	logs [][]interface{}
-}
-
 func enableDebugLog() { logrus.SetLevel(logrus.DebugLevel) }
 
 func newDefaultLog() Logger {
 	l := logrus.New()
 	l.Level = logrus.GetLevel()
 	return l
-}
-
-func (r *recorder) log(a ...interface{}) {
-	r.logs = append(r.logs, a)
-}
-
-func (r *recorder) logf(l logrus.Level, f string, a ...interface{}) {
-	r.log(l, fmt.Sprintf(f, a...))
-}
-
-func (r *recorder) Errorln(a ...interface{}) {
-	r.log(append([]interface{}{logrus.ErrorLevel}, a...)...)
-}
-
-func (r *recorder) Warnln(a ...interface{}) {
-	r.log(append([]interface{}{logrus.WarnLevel}, a...)...)
-}
-
-func (r *recorder) Infoln(a ...interface{}) {
-	r.log(append([]interface{}{logrus.InfoLevel}, a...)...)
-}
-
-func (r *recorder) Debugln(a ...interface{}) {
-	r.log(append([]interface{}{logrus.DebugLevel}, a...)...)
-}
-
-func (r *recorder) Debugf(f string, a ...interface{}) {
-	r.logf(logrus.DebugLevel, f, a...)
 }

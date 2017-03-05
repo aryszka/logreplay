@@ -2,6 +2,9 @@ package logreplay
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/sirupsen/logrus"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -53,8 +56,14 @@ type logReader struct {
 	text string
 }
 
+type failingReader struct{}
+
 type testJSONParser struct {
 	test *testing.T
+}
+
+type recorder struct {
+	logs [][]interface{}
 }
 
 var (
@@ -159,6 +168,10 @@ func (l *logReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+func (f *failingReader) Read(p []byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
 func (p *testJSONParser) Parse(line string) *Request {
 	var m map[string]string
 	err := json.Unmarshal([]byte(line), &m)
@@ -174,6 +187,34 @@ func (p *testJSONParser) Parse(line string) *Request {
 	}
 }
 
+func (r *recorder) log(a ...interface{}) {
+	r.logs = append(r.logs, a)
+}
+
+func (r *recorder) logf(l logrus.Level, f string, a ...interface{}) {
+	r.log(l, fmt.Sprintf(f, a...))
+}
+
+func (r *recorder) Errorln(a ...interface{}) {
+	r.log(append([]interface{}{logrus.ErrorLevel}, a...)...)
+}
+
+func (r *recorder) Warnln(a ...interface{}) {
+	r.log(append([]interface{}{logrus.WarnLevel}, a...)...)
+}
+
+func (r *recorder) Infoln(a ...interface{}) {
+	r.log(append([]interface{}{logrus.InfoLevel}, a...)...)
+}
+
+func (r *recorder) Debugln(a ...interface{}) {
+	r.log(append([]interface{}{logrus.DebugLevel}, a...)...)
+}
+
+func (r *recorder) Debugf(f string, a ...interface{}) {
+	r.logf(logrus.DebugLevel, f, a...)
+}
+
 func play(t *testing.T, p *Player) {
 	if err := p.Play(); err != nil {
 		t.Error(err)
@@ -187,7 +228,7 @@ func once(t *testing.T, p *Player) {
 }
 
 func test(t *testing.T, concurrency int) {
-	t.Run("TestReplayAccessLog", func(t *testing.T) {
+	t.Run("ReplayAccessLog", func(t *testing.T) {
 		const accessLog = `
 			1.2.3.4, 5.6.7.8, 9.0.1.2 - - [02/Mar/2017:11:43:00 +0000] "GET /foo HTTP/1.1" 200 566 "https://www.example.org/bar.html", "Mozilla/5.0 (iPhone; CPU iPHone OS 10_2_1 like Mac OS X) AppleWebKit/600.1.4 (KHTML, like Gecko) GSA/23.0.1234 Mobile/14D27 Safari/600.1.4" 1 www.example.org
 			1.2.3.4, 5.6.7.8, 9.0.1.2 - - [02/Mar/2017:11:43:00 +0000] "POST /api/foo HTTP/1.1" 200 138 "https://www.example.org/bar.html", "Mozilla/5.0 (iPhone; CPU iPHone OS 10_2_1 like Mac OS X) AppleWebKit/600.1.4 (KHTML, like Gecko) GSA/23.0.1234 Mobile/14D27 Safari/600.1.4" 1 api.example.org
@@ -228,7 +269,7 @@ func test(t *testing.T, concurrency int) {
 		}})
 	})
 
-	t.Run("TestReplayBlank", func(t *testing.T) {
+	t.Run("ReplayBlank", func(t *testing.T) {
 		const requestCount = 3
 
 		c := &counterHandler{}
@@ -261,7 +302,7 @@ func test(t *testing.T, concurrency int) {
 		}
 	})
 
-	t.Run("TestCustomFormat", func(t *testing.T) {
+	t.Run("CustomFormat", func(t *testing.T) {
 		const logs = `
 			GET /foo www.example.org
 			POST /api/foo api.example.org
@@ -306,7 +347,7 @@ func test(t *testing.T, concurrency int) {
 		}})
 	})
 
-	t.Run("TestCustomParser", func(t *testing.T) {
+	t.Run("CustomParser", func(t *testing.T) {
 		const logs = `
 			{"method": "GET", "host": "www.example.org", "path": "/foo"}
 			{"method": "POST", "host": "api.example.org", "path": "/api/foo"}
@@ -352,7 +393,7 @@ func test(t *testing.T, concurrency int) {
 		}})
 	})
 
-	t.Run("TestInfiniteLoop", func(t *testing.T) {
+	t.Run("InfiniteLoop", func(t *testing.T) {
 		const logs = `
 			GET /foo www.example.org
 			POST /api/foo api.example.org
@@ -390,7 +431,7 @@ func test(t *testing.T, concurrency int) {
 		p.Stop()
 	})
 
-	t.Run("TestErrorOnNoRequests", func(t *testing.T) {
+	t.Run("ErrorOnNoRequests", func(t *testing.T) {
 		p, err := New(Options{ConcurrentSessions: concurrency})
 		if err != nil {
 			t.Error(err)
@@ -402,7 +443,7 @@ func test(t *testing.T, concurrency int) {
 		}
 	})
 
-	t.Run("TestCombined", func(t *testing.T) {
+	t.Run("Combined", func(t *testing.T) {
 		const logs = `
 			GET /foo www.example.org
 			POST /api/foo api.example.org
@@ -450,7 +491,7 @@ func test(t *testing.T, concurrency int) {
 		p.Stop()
 	})
 
-	t.Run("TestDoesNotFollowRedirects", func(t *testing.T) {
+	t.Run("DoesNotFollowRedirects", func(t *testing.T) {
 		notify := make(signalChannel)
 		s := httptest.NewServer(chainHandlers(
 			&limitHandler{notify: notify, limit: concurrency * 2},
@@ -485,7 +526,7 @@ func test(t *testing.T, concurrency int) {
 		}
 	})
 
-	t.Run("TestFollowSameHostOnly", func(t *testing.T) {
+	t.Run("FollowSameHostOnly", func(t *testing.T) {
 		c1 := &counterHandler{}
 		s1 := httptest.NewServer(c1)
 		defer s1.Close()
@@ -532,7 +573,7 @@ func test(t *testing.T, concurrency int) {
 		}
 	})
 
-	t.Run("TestFollowRedirect", func(t *testing.T) {
+	t.Run("FollowRedirect", func(t *testing.T) {
 		c1 := &counterHandler{}
 		s1 := httptest.NewServer(c1)
 		defer s1.Close()
@@ -565,7 +606,7 @@ func test(t *testing.T, concurrency int) {
 		}
 	})
 
-	t.Run("TestStopsOnError", func(t *testing.T) {
+	t.Run("StopsOnError", func(t *testing.T) {
 		s := httptest.NewServer(statusHandler(http.StatusOK))
 		s.Close()
 
@@ -587,7 +628,7 @@ func test(t *testing.T, concurrency int) {
 		}
 	})
 
-	t.Run("TestStopsOn5xx", func(t *testing.T) {
+	t.Run("StopsOn5xx", func(t *testing.T) {
 		s := httptest.NewServer(statusHandler(http.StatusInternalServerError))
 		defer s.Close()
 
@@ -610,7 +651,7 @@ func test(t *testing.T, concurrency int) {
 		}
 	})
 
-	t.Run("TestStopsOnErrorInOnce", func(t *testing.T) {
+	t.Run("StopsOnErrorInOnce", func(t *testing.T) {
 		s := httptest.NewServer(statusHandler(http.StatusOK))
 		s.Close()
 
@@ -632,7 +673,7 @@ func test(t *testing.T, concurrency int) {
 		}
 	})
 
-	t.Run("TestStopsOn5xxInOnce", func(t *testing.T) {
+	t.Run("StopsOn5xxInOnce", func(t *testing.T) {
 		s := httptest.NewServer(statusHandler(http.StatusInternalServerError))
 		defer s.Close()
 
@@ -655,7 +696,7 @@ func test(t *testing.T, concurrency int) {
 		}
 	})
 
-	t.Run("TestRequestWithContent", func(t *testing.T) {
+	t.Run("RequestWithContent", func(t *testing.T) {
 		cl := &contentLengthHandler{}
 		s := httptest.NewServer(cl)
 		defer s.Close()
@@ -681,7 +722,7 @@ func test(t *testing.T, concurrency int) {
 		}
 	})
 
-	t.Run("TestAccessLogWithContent", func(t *testing.T) {
+	t.Run("AccessLogWithContent", func(t *testing.T) {
 		const (
 			log    = `POST /foo www.example.org`
 			format = `^(?P<method>\S+)\s+(?P<path>\S+)\s+(?P<host>\S+)$`
@@ -715,6 +756,97 @@ func test(t *testing.T, concurrency int) {
 
 		if cl.length < concurrency*450 || cl.length > concurrency*550 {
 			t.Error("failed to send the right content", cl.length)
+		}
+	})
+
+	t.Run("Throttle", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip()
+		}
+
+		s := httptest.NewServer(statusHandler(http.StatusOK))
+		defer s.Close()
+
+		requests := []*Request{{}, {}, {}}
+		p, err := New(Options{
+			Requests: requests,
+			Server:   s.URL,
+			Throttle: 5,
+		})
+
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		start := time.Now()
+		p.Once()
+		duration := time.Now().Sub(start)
+		if duration < 600*time.Millisecond {
+			t.Error("too fast, throttle failed")
+		}
+	})
+
+	t.Run("OncePausePlayStop", func(t *testing.T) {
+		signal := make(signalChannel)
+		s := httptest.NewServer(&slowMotionHandler{signal})
+		defer s.Close()
+
+		requests := []*Request{{}, {}, {}}
+		p, err := New(Options{
+			Requests: requests,
+			Server:   s.URL,
+		})
+
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		done := make(signalChannel)
+		go func() {
+			go p.Once()
+			signal <- signalToken{}
+			p.Pause()
+			go p.Play()
+			signal <- signalToken{}
+			signal <- signalToken{}
+			signal <- signalToken{}
+			p.Stop()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(120 * time.Millisecond):
+			t.Error("timeout")
+		}
+	})
+
+	t.Run("InvalidFormat", func(t *testing.T) {
+		_, err := New(Options{
+			AccessLog:       &logReader{},
+			AccessLogFormat: "\\",
+		})
+
+		if err == nil {
+			t.Error("failed to fail")
+		}
+	})
+
+	t.Run("ReadFailed", func(t *testing.T) {
+		p, err := New(Options{
+			AccessLog: &failingReader{},
+		})
+
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		err = p.Play()
+		if err != ErrRequestError {
+			t.Error("failed to fail")
 		}
 	})
 }

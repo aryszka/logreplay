@@ -65,10 +65,6 @@ func (p *defaultParser) Parse(l string) *Request {
 	r := &Request{}
 	m := p.format.FindStringSubmatch(l)
 	for i, ni := range p.names {
-		if i >= len(m) {
-			break
-		}
-
 		switch ni {
 		case "method":
 			r.Method = m[i]
