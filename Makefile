@@ -33,7 +33,7 @@ check-ineffassign: $(SOURCES)
 	ineffassign .
 
 check-spell: $(SOURCES) README.md Makefile
-	misspell -error README.md Makefile *.go
+	misspell -error README.md Makefile $(SOURCES)
 
 lint: $(SOURCES)
 	golint -set_exit_status -min_confidence 0.9
